@@ -42,9 +42,8 @@ secrets/
 # Claude / AI tooling
 .claude/
 
-# Streamlit
+# Streamlit — only exclude secrets, never config.toml
 .streamlit/secrets.toml
-.streamlit/*.toml
 
 # Cache
 .cache/

@@ -1,0 +1,25 @@
+[theme]
+base                  = "dark"
+primaryColor          = "#7c3aed"
+backgroundColor       = "#0d1117"
+secondaryBackgroundColor = "#161b22"
+textColor             = "#e6edf3"
+font                  = "sans serif"
+
+# These stop the browser console "invalid color" warnings
+widgetBackgroundColor = "#161b22"
+widgetBorderColor     = "#30363d"
+skeletonBackgroundColor = "#21262d"
+
+[server]
+headless            = true
+enableCORS          = false
+enableXsrfProtection = false
+runOnSave           = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = false
+toolbarMode      = "minimal"
