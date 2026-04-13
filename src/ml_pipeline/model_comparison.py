@@ -47,8 +47,8 @@ def compare_base_models(
         }
         if fair is not None:
             row["DI"]  = round(fair.disparate_impact, 4)
-            row["SPD"] = round(fair.statistical_parity_difference, 4)
-            row["EOD"] = round(fair.equalized_odds_difference, 4)
+            row["SPD"] = round(fair.statistical_parity_diff, 4)
+            row["EOD"] = round(fair.equalized_odds_diff, 4)
         else:
             row["DI"] = row["SPD"] = row["EOD"] = None
 

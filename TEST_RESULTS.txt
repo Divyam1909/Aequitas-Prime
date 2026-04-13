@@ -1,0 +1,217 @@
+================================================================================
+  AEQUITAS PRIME — FULL TEST SUITE RESULTS
+  Run date : 2026-04-13
+  Platform : win32  |  Python 3.13.2  |  pytest 9.0.2
+================================================================================
+
+============================= test session starts ==============================
+platform win32 -- Python 3.13.2, pytest-9.0.2, pluggy-1.6.0
+rootdir: C:\Users\divya\Desktop\google-hackathon
+collected 70 items
+
+────────────────────────────────────────────────────────────────────────────────
+ INTEGRATION TESTS  —  tests/integration/test_pipeline.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestBaselinePipeline
+  ├── test_result_not_none                          PASSED   [  1%]
+  ├── test_baseline_eval_populated                  PASSED   [  2%]
+  ├── test_baseline_accuracy_reasonable             PASSED   [  4%]
+  ├── test_n_features_positive                      PASSED   [  5%]
+  ├── test_baseline_metrics_has_sex                 PASSED   [  7%]
+  ├── test_proxy_scan_runs                          PASSED   [  8%]
+  ├── test_mitigation_not_run                       PASSED   [ 10%]
+  └── test_internal_state_preserved                 PASSED   [ 11%]
+
+  TestMitigationSteps
+  ├── test_preprocessed_eval_populated              PASSED   [ 12%]
+  ├── test_preprocessed_accuracy_reasonable         PASSED   [ 14%]
+  ├── test_reweigh_result_populated                 PASSED   [ 15%]
+  ├── test_di_improves_after_mitigation             PASSED   [ 17%]
+  └── test_comparison_df_built                      PASSED   [ 18%]
+
+  TestModelComparison
+  ├── test_compare_base_models_returns_dataframe    PASSED   [ 20%]
+  ├── test_compare_all_three_models                 PASSED   [ 21%]
+  └── test_all_accuracies_valid                     PASSED   [ 22%]
+
+────────────────────────────────────────────────────────────────────────────────
+ UNIT TESTS  —  tests/unit/test_counterfactual.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestCounterfactualCheck
+  ├── test_biased_model_flips_decision              PASSED   [ 24%]
+  ├── test_fair_model_clear_risk                    PASSED   [ 25%]
+  ├── test_result_fields_populated                  PASSED   [ 27%]
+  └── test_confidence_delta_non_negative            PASSED   [ 28%]
+
+────────────────────────────────────────────────────────────────────────────────
+ UNIT TESTS  —  tests/unit/test_detector.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestDisparateImpact
+  ├── test_biased_di_below_threshold                PASSED   [ 30%]
+  ├── test_fair_di_near_one                         PASSED   [ 31%]
+  ├── test_di_positive                              PASSED   [ 32%]
+  └── test_di_uses_positive_label                   PASSED   [ 34%]
+
+  TestSPD
+  ├── test_biased_spd_negative                      PASSED   [ 35%]
+  └── test_fair_spd_near_zero                       PASSED   [ 37%]
+
+  TestComputeAllMetrics
+  ├── test_returns_all_fields_with_y_pred           PASSED   [ 38%]
+  ├── test_biased_severity_not_clear                PASSED   [ 40%]
+  ├── test_fair_severity_clear                      PASSED   [ 41%]
+  ├── test_compute_all_attrs_returns_dict_with_key  PASSED   [ 42%]
+  ├── test_group_counts_sum_to_total                PASSED   [ 44%]
+  └── test_post_training_metrics_nan_without_y_pred PASSED   [ 45%]
+
+────────────────────────────────────────────────────────────────────────────────
+ UNIT TESTS  —  tests/unit/test_generic_preprocessor.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestAutoDetectProtectedAttrs
+  ├── test_detects_sex_and_race                     PASSED   [ 47%]
+  ├── test_excludes_target_col                      PASSED   [ 48%]
+  ├── test_returns_list                             PASSED   [ 50%]
+  └── test_no_duplicates                            PASSED   [ 51%]
+
+  TestAutoDetectTarget
+  ├── test_detects_income                           PASSED   [ 52%]
+  └── test_fallback_to_last_col                     PASSED   [ 54%]
+
+  TestPreprocessGeneric
+  ├── test_returns_three_objects                    PASSED   [ 55%]
+  ├── test_X_has_no_target_col                      PASSED   [ 57%]
+  ├── test_y_is_binary                              PASSED   [ 58%]
+  ├── test_X_is_all_numeric                         PASSED   [ 60%]
+  ├── test_sex_encoded_as_binary                    PASSED   [ 61%]
+  ├── test_df_clean_preserves_original_sex_values   PASSED   [ 62%]
+  ├── test_no_rows_dropped_without_nan              PASSED   [ 64%]
+  └── test_drops_rows_with_nan_in_key_cols          PASSED   [ 65%]
+
+────────────────────────────────────────────────────────────────────────────────
+ UNIT TESTS  —  tests/unit/test_intersectional.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestIntersectionalMetrics
+  ├── test_returns_list                             PASSED   [ 67%]
+  ├── test_single_attr_returns_both_groups          PASSED   [ 68%]
+  ├── test_each_result_is_intersectional_result     PASSED   [ 70%]
+  ├── test_di_positive                              PASSED   [ 71%]
+  ├── test_biased_female_group_di_below_one         PASSED   [ 72%]
+  ├── test_sorted_ascending_by_di                   PASSED   [ 74%]
+  ├── test_group_size_above_minimum                 PASSED   [ 75%]
+  └── test_with_y_pred_populates_eopd               PASSED   [ 77%]
+
+────────────────────────────────────────────────────────────────────────────────
+ UNIT TESTS  —  tests/unit/test_mitigator.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestReweighing
+  ├── test_returns_weights_same_length              PASSED   [ 78%]
+  ├── test_weights_positive                         PASSED   [ 80%]
+  ├── test_unprivileged_positive_upweighted         PASSED   [ 81%]
+  ├── test_group_weight_map_populated               PASSED   [ 82%]
+  └── test_weights_sum_approximately_equal_n        PASSED   [ 84%]
+
+────────────────────────────────────────────────────────────────────────────────
+ UNIT TESTS  —  tests/unit/test_provenance.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestBiasProvenance
+  ├── test_returns_provenance_report                PASSED   [ 85%]
+  ├── test_primary_source_is_valid                  PASSED   [ 87%]
+  ├── test_high_proxy_triggers_feature_bias         PASSED   [ 88%]
+  ├── test_no_proxies_does_not_flag_feature_bias_primary  PASSED   [ 90%]
+  ├── test_confidence_in_range                      PASSED   [ 91%]
+  ├── test_recommended_fixes_not_empty              PASSED   [ 92%]
+  └── test_evidence_populated                       PASSED   [ 94%]
+
+────────────────────────────────────────────────────────────────────────────────
+ UNIT TESTS  —  tests/unit/test_proxy_scanner.py
+────────────────────────────────────────────────────────────────────────────────
+
+  TestProxyScanner
+  ├── test_correlated_feature_flagged_high          PASSED   [ 95%]
+  ├── test_random_feature_low_or_negligible         PASSED   [ 97%]
+  ├── test_returns_dict_keyed_by_attr               PASSED   [ 98%]
+  └── test_each_result_is_proxy_result              PASSED   [100%]
+
+================================================================================
+  SUMMARY
+================================================================================
+
+  Total tests   :  70
+  Passed        :  70   ✓
+  Failed        :   0
+  Errors        :   0
+  Skipped       :   0
+
+  Duration      :  5.01s
+
+  Result        :  ALL TESTS PASSED
+
+================================================================================
+  TEST BREAKDOWN BY MODULE
+================================================================================
+
+  Module                           Tests   Passed   Failed
+  ──────────────────────────────── ──────  ──────── ──────
+  integration / test_pipeline         16       16        0
+  unit / test_counterfactual           4        4        0
+  unit / test_detector                12       12        0
+  unit / test_generic_preprocessor    10       10        0
+  unit / test_intersectional           8        8        0
+  unit / test_mitigator                5        5        0
+  unit / test_provenance               7        7        0
+  unit / test_proxy_scanner            4        4        0
+  ──────────────────────────────── ──────  ──────── ──────
+  TOTAL                               70       70        0
+
+================================================================================
+  WHAT EACH MODULE TESTS
+================================================================================
+
+  test_pipeline (integration)
+    Verifies the full end-to-end pipeline on a synthetic biased dataset:
+    baseline-only run, on-demand mitigation, DI improvement after reweighing,
+    and multi-model comparison (RF vs LR vs XGB).
+
+  test_counterfactual
+    Verifies the Counterfactual Ghost Engine: a deliberately biased stub model
+    produces CRITICAL risk when the decision flips; a fair stub model produces
+    CLEAR. Validates all result fields and confidence delta sign.
+
+  test_detector
+    Verifies all 6 fairness metrics (DI, SPD, EOD, EOpD, PP, FNRP) against
+    synthetic data with known bias levels. Checks severity thresholds, group
+    count arithmetic, and NaN behaviour when y_pred is absent.
+
+  test_generic_preprocessor
+    Verifies keyword-based + cardinality-based protected-attribute auto-detection,
+    target-column auto-detection, binary encoding of protected attrs, ordinal
+    encoding of other categoricals, NaN row dropping, and df_clean preservation.
+
+  test_intersectional
+    Verifies group enumeration, DI direction (Female DI < 0.8 in biased data),
+    ascending sort order (worst first), MIN_GROUP_SIZE filtering, and EOpD
+    population when y_pred is supplied.
+
+  test_mitigator
+    Verifies AIF360 Reweighing: weight array length, positivity, directional
+    correctness (unprivileged+positive upweighted vs privileged+positive),
+    group_weight_map population, and sum(weights) ≈ N normalisation.
+
+  test_provenance
+    Verifies bias root-cause detection: high-MI proxy triggers feature_bias,
+    negligible proxy does not, confidence stays in [0,1], and evidence /
+    recommended_fixes lists are non-empty.
+
+  test_proxy_scanner
+    Verifies Mutual Information–based proxy detection: a near-perfect copy of
+    the protected attribute is flagged HIGH; a pure-noise column is LOW or
+    NEGLIGIBLE. Validates result types and risk_level vocabulary.
+
+================================================================================
