@@ -1,0 +1,32 @@
+# Streamlit Cloud deployment requirements
+# TensorFlow is intentionally excluded (too large for Streamlit Cloud free tier, 1GB limit)
+# AdversarialDebiasing (Tier 3 in-processing) is disabled on cloud deployment
+
+# ── Core data ──────────────────────────────────────────────────────────────────
+pandas>=2.0
+numpy>=1.26
+
+# ── Machine learning ───────────────────────────────────────────────────────────
+scikit-learn>=1.4
+
+# ── Fairness engines ───────────────────────────────────────────────────────────
+aif360>=0.6.1
+fairlearn>=0.10.0
+
+# ── Explainability ─────────────────────────────────────────────────────────────
+shap>=0.44.0
+lime>=0.2.0.1
+
+# ── Visualization & UI ─────────────────────────────────────────────────────────
+streamlit>=1.32.0
+plotly>=5.18.0
+
+# ── PDF report ─────────────────────────────────────────────────────────────────
+reportlab>=4.1.0
+
+# ── LLM narrative (Gemini — free tier) ────────────────────────────────────────
+google-generativeai>=0.8.0
+
+# ── Data validation & stats ────────────────────────────────────────────────────
+pydantic>=2.6.0
+scipy>=1.12.0

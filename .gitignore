@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Model artifacts
+models/*.pkl
+models/*.joblib
+models/*.h5
+models/metadata*.json
+
+# Reports (generated)
+reports/*.pdf
+
+# Data (raw is tracked, processed is not)
+data/processed/
+*.csv.gz
+
+# Secrets / config
+.env
+.env.local
+*.key
+*.pem
+*.p12
+credentials.json
+service_account*.json
+google_credentials*.json
+secrets/
+
+# Claude / AI tooling
+.claude/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/*.toml
+
+# Cache
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db

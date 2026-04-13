@@ -1,0 +1,46 @@
+# ── Core data ──────────────────────────────────────────────────────────────────
+pandas>=2.0
+numpy>=1.26
+
+# ── Machine learning ───────────────────────────────────────────────────────────
+scikit-learn>=1.4
+xgboost>=2.0
+
+# ── Fairness engines ───────────────────────────────────────────────────────────
+aif360>=0.6.1
+fairlearn>=0.10.0
+
+# ── Explainability ─────────────────────────────────────────────────────────────
+shap>=0.44.0
+lime>=0.2.0.1
+
+# ── Visualization & UI ─────────────────────────────────────────────────────────
+streamlit>=1.32.0
+plotly>=5.18.0
+
+# ── Backend API ────────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+
+# ── PDF report ─────────────────────────────────────────────────────────────────
+reportlab>=4.1.0
+
+# ── LLM narrative (Gemini — free tier, 15 RPM, 1M tokens/day) ─────────────────
+# Get free API key at: https://aistudio.google.com/apikey
+google-generativeai>=0.8.0
+
+# ── Data validation ────────────────────────────────────────────────────────────
+pydantic>=2.6.0
+
+# ── Statistics ─────────────────────────────────────────────────────────────────
+scipy>=1.12.0
+
+# ── Testing ────────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# ── TensorFlow (optional — for AdversarialDebiasing, Tier 3 in-processing)
+# Install separately if needed: pip install tensorflow>=2.15
+# tensorflow>=2.15.0

@@ -1,0 +1,29 @@
+{
+  "model_type": "baseline",
+  "dataset_name": "UCI Adult Income",
+  "protected_attrs": [
+    "sex",
+    "race"
+  ],
+  "target_col": "income",
+  "feature_names": [
+    "age",
+    "fnlwgt",
+    "education-num",
+    "capital-gain",
+    "capital-loss",
+    "hours-per-week",
+    "workclass",
+    "education",
+    "marital-status",
+    "occupation",
+    "relationship",
+    "native-country",
+    "sex",
+    "race_binary"
+  ],
+  "train_date": "2026-04-11T18:12:55.743101",
+  "metrics": {
+    "accuracy": 0.8509673852957435
+  }
+}
