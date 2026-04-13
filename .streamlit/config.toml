@@ -6,10 +6,6 @@ secondaryBackgroundColor = "#161b22"
 textColor             = "#e6edf3"
 font                  = "sans serif"
 
-# These stop the browser console "invalid color" warnings
-widgetBackgroundColor = "#161b22"
-widgetBorderColor     = "#30363d"
-skeletonBackgroundColor = "#21262d"
 
 [server]
 headless            = true
