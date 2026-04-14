@@ -1,6 +1,16 @@
 """
-Aequitas Prime — Streamlit Dashboard
-7 tabs: Bias X-Ray | BYOM | Surgeon | Intersectional | Counterfactual Panel | Ghost | Report
+Aequitas Prime — Streamlit Dashboard  V2
+Tabs: Bias X-Ray | BYOM | Surgeon | Intersectional | Causal | CF Panel | Ghost | Report
+V2 additions:
+  - Wizard mode: linear step-by-step guide
+  - Bootstrap CI on 6-metric table
+  - Combined-score proxy scanner
+  - Intersectional small-group Wilson CI
+  - Group SHAP comparison in Surgeon
+  - Causal Fairness tab (mediation)
+  - Multi-provider LLM selector (Gemini / OpenAI / Claude / Ollama)
+  - Audit persistence: Save + History
+  - String labels in Counterfactual Panel
 """
 
 import os
@@ -223,12 +233,24 @@ METRIC_HELP = {
 }
 
 
-def show_six_metric_table(bm, attr_name: str):
-    """Render the 6-metric PASS/FAIL table for one MetricsResult object."""
+def show_six_metric_table(bm, attr_name: str, show_ci: bool = False, ci_obj: "dict | None" = None):
+    """
+    Render the 6-metric PASS/FAIL table for one MetricsResult object.
+    V2: show_ci=True adds 95% confidence interval columns when available.
+    ci_obj: optional dict of {metric_field: ConfidenceInterval} from compute_bootstrap_ci.
+    """
     if bm is None:
         st.warning("Metrics not available.")
         return
     rows = []
+    metric_ci_map = {
+        "Disparate Impact":        "ci_disparate_impact",
+        "Statistical Parity Diff": "ci_statistical_parity_diff",
+        "Equalized Odds Diff":     "ci_equalized_odds_diff",
+        "Equal Opportunity Diff":  "ci_equal_opportunity_diff",
+        "Predictive Parity":       "ci_predictive_parity_diff",
+        "FNR Parity":              "ci_fnr_parity_diff",
+    }
     metrics_vals = [
         ("Disparate Impact",        bm.disparate_impact,        lambda v: v >= 0.80),
         ("Statistical Parity Diff", bm.statistical_parity_diff, lambda v: v >= -0.10),
@@ -241,18 +263,30 @@ def show_six_metric_table(bm, attr_name: str):
         threshold, meaning = METRIC_HELP[name]
         is_nan = isinstance(val, float) and np.isnan(val)
         status = "— N/A" if is_nan else ("✅ PASS" if passes(val) else "❌ FAIL")
-        rows.append({
+        row = {
             "Metric":           name,
             "Value":            "—" if is_nan else f"{val:.3f}",
             "Pass Threshold":   threshold,
             "Status":           status,
             "Plain-English Meaning": meaning,
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
-                 column_config={
-                     "Status":                   st.column_config.TextColumn(width="small"),
-                     "Plain-English Meaning":    st.column_config.TextColumn(width="large"),
-                 })
+        }
+        if show_ci:
+            ci_field = metric_ci_map.get(name)
+            ci = getattr(bm, ci_field, None) if ci_field and hasattr(bm, ci_field) else None
+            if ci is not None and not (isinstance(ci.lower, float) and np.isnan(ci.lower)):
+                row["95% CI"] = f"[{ci.lower:.3f}, {ci.upper:.3f}]"
+            else:
+                row["95% CI"] = "—"
+        rows.append(row)
+
+    col_cfg = {
+        "Status":                st.column_config.TextColumn(width="small"),
+        "Plain-English Meaning": st.column_config.TextColumn(width="large"),
+    }
+    if show_ci:
+        col_cfg["95% CI"] = st.column_config.TextColumn(width="medium")
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, column_config=col_cfg)
     fail_count = sum(1 for r in rows if "FAIL" in r["Status"])
     if fail_count == 0:
         st.success(f"All metrics PASS for **{attr_name}**. No statistically significant bias detected.")
@@ -498,16 +532,83 @@ with st.sidebar:
         """, unsafe_allow_html=True)
 
     st.divider()
-    st.markdown('<span style="color:#8b949e;font-size:0.82rem">GEMINI API KEY (optional)</span>', unsafe_allow_html=True)
-    gemini_key = st.text_input(
-        "Key", type="password",
-        value=os.environ.get("GEMINI_API_KEY", ""),
+
+    # ── V2: Wizard mode toggle ─────────────────────────────────────────────────
+    wizard_mode = st.toggle("🧙 Guided Wizard Mode", value=False, key="wizard_mode",
+                             help="Switch to a step-by-step linear flow (Upload → Configure → Detect → Mitigate → Report).")
+
+    st.divider()
+
+    # ── V2: Multi-provider LLM config ─────────────────────────────────────────
+    st.markdown('<span style="color:#8b949e;font-size:0.82rem">AI NARRATIVE PROVIDER</span>', unsafe_allow_html=True)
+    llm_provider = st.selectbox(
+        "Provider", options=["gemini", "openai", "claude", "ollama", "none"],
+        index=0, key="llm_provider",
         label_visibility="collapsed",
-        help="Free key at aistudio.google.com/apikey — powers AI narrative in Report tab. Works without it."
+        help="gemini=free via aistudio.google.com | openai=GPT-4o-mini | claude=Sonnet | ollama=local | none=fallback"
     )
-    if gemini_key:
-        os.environ["GEMINI_API_KEY"] = gemini_key
+    st.session_state["_llm_provider"] = llm_provider
+
+    if llm_provider == "gemini":
+        _key = st.text_input("Gemini API Key", type="password",
+                              value=os.environ.get("GEMINI_API_KEY", ""),
+                              label_visibility="collapsed", key="llm_key_gemini",
+                              help="Free key at aistudio.google.com/apikey")
+        if _key:
+            os.environ["GEMINI_API_KEY"] = _key
+        st.session_state["_llm_api_key"] = _key
+    elif llm_provider == "openai":
+        _key = st.text_input("OpenAI API Key", type="password",
+                              value=os.environ.get("OPENAI_API_KEY", ""),
+                              label_visibility="collapsed", key="llm_key_openai")
+        if _key:
+            os.environ["OPENAI_API_KEY"] = _key
+        st.session_state["_llm_api_key"] = _key
+    elif llm_provider == "claude":
+        _key = st.text_input("Anthropic API Key", type="password",
+                              value=os.environ.get("ANTHROPIC_API_KEY", ""),
+                              label_visibility="collapsed", key="llm_key_claude")
+        if _key:
+            os.environ["ANTHROPIC_API_KEY"] = _key
+        st.session_state["_llm_api_key"] = _key
+    elif llm_provider == "ollama":
+        ollama_url = st.text_input("Ollama URL", value="http://localhost:11434",
+                                    label_visibility="collapsed", key="llm_ollama_url")
+        st.session_state["_llm_ollama_url"] = ollama_url
+        st.session_state["_llm_api_key"] = ""
+    else:
+        st.session_state["_llm_api_key"] = ""
     st.markdown('<span style="color:#6b7280;font-size:0.75rem">Leave blank — fallback narrative auto-generates.</span>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── V2: Audit Persistence ──────────────────────────────────────────────────
+    if model_ready:
+        if st.button("💾 Save Audit Snapshot", use_container_width=True,
+                     help="Save this audit to local history for comparison across runs."):
+            try:
+                from src.utils.persistence import save_audit
+                _aid = save_audit(st.session_state["pipeline_result"])
+                st.success(f"Saved: {_aid[:20]}…")
+            except Exception as _e:
+                st.error(f"Save failed: {_e}")
+
+    if st.button("📜 Audit History", use_container_width=True,
+                 help="View previously saved audits."):
+        st.session_state["_show_history"] = not st.session_state.get("_show_history", False)
+
+    if st.session_state.get("_show_history", False):
+        try:
+            from src.utils.persistence import audit_history_dataframe
+            _hist = audit_history_dataframe()
+            if _hist.empty:
+                st.caption("No saved audits yet.")
+            else:
+                st.dataframe(_hist.drop(columns=["audit_id"], errors="ignore"),
+                             use_container_width=True, hide_index=True,
+                             column_config={"ΔDI": st.column_config.NumberColumn(format="%.3f")})
+        except Exception as _e:
+            st.caption(f"History unavailable: {_e}")
 
     st.divider()
     st.markdown("""
@@ -517,6 +618,7 @@ with st.sidebar:
       🤖 <b>BYOM</b> — audit your own model's predictions<br>
       ⚗️ <b>Surgeon</b> — mitigate & compare<br>
       🧩 <b>Intersectional</b> — compound group bias<br>
+      🔬 <b>Causal</b> — direct vs indirect discrimination<br>
       🔀 <b>CF Panel</b> — dataset-level flip evidence<br>
       👻 <b>Ghost</b> — live single-prediction firewall<br>
       📄 <b>Report</b> — PDF + shareable badge
@@ -529,15 +631,151 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab4b, tab5, tab6, tab7 = st.tabs([
     "🔍 Bias X-Ray",
     "🤖 BYOM",
     "⚗️ Surgeon",
     "🧩 Intersectional",
+    "🔬 Causal",
     "🔀 CF Panel",
     "👻 Ghost",
     "📄 Report",
 ])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V2: WIZARD MODE (linear guided flow shown when wizard_mode toggle is on)
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.get("wizard_mode", False):
+    st.markdown("## 🧙 Guided Wizard Mode")
+    hint(
+        "Follow these steps in order. Each step unlocks the next. "
+        "Toggle <b>Guided Wizard Mode</b> off in the sidebar to return to the full expert layout."
+    )
+
+    _wiz_step = st.session_state.get("_wiz_step", 1)
+    _wiz_steps = ["1. Upload Dataset", "2. Configure Audit", "3. Run Bias X-Ray",
+                  "4. Run Mitigation", "5. Generate Report"]
+    st.progress((_wiz_step - 1) / (len(_wiz_steps) - 1), text=_wiz_steps[_wiz_step - 1])
+
+    # --- Step 1: Upload ---
+    if _wiz_step >= 1:
+        st.markdown("### Step 1 — Upload Your Dataset")
+        _wup = st.file_uploader("Upload CSV", type=["csv"], key="wiz_upload")
+        _wdemo = st.button("Or use UCI Adult Income demo", key="wiz_demo")
+        if _wup is not None:
+            try:
+                _wdf = pd.read_csv(_wup, sep=None, engine="python", na_values=["?", " ?"])
+                _wdf[_wdf.select_dtypes("object").columns] = _wdf.select_dtypes("object").apply(lambda c: c.str.strip())
+                st.session_state["raw_df"]     = _wdf
+                st.session_state["_use_adult"] = False
+                if _wiz_step == 1:
+                    st.session_state["_wiz_step"] = 2
+                    st.rerun()
+            except Exception as _we:
+                st.error(f"Cannot read CSV: {_we}")
+        if _wdemo:
+            from src.utils.data_loader import load_csv
+            try:
+                st.session_state["raw_df"]     = load_csv("data/raw/adult.csv")
+                st.session_state["_use_adult"] = True
+                st.session_state["_wiz_step"]  = 2
+                st.rerun()
+            except Exception as _we:
+                st.error(f"Cannot load demo: {_we}")
+
+    # --- Step 2: Configure ---
+    if _wiz_step >= 2 and "raw_df" in st.session_state:
+        st.divider()
+        st.markdown("### Step 2 — Configure Audit")
+        _wconfig = build_config_ui(st.session_state["raw_df"],
+                                    is_demo=st.session_state.get("_use_adult", False))
+        if _wconfig and st.button("✅ Confirm Configuration", key="wiz_cfg_ok"):
+            st.session_state["_wiz_config"] = _wconfig
+            st.session_state["_wiz_step"]   = 3
+            st.rerun()
+
+    # --- Step 3: Run X-Ray ---
+    if _wiz_step >= 3 and "raw_df" in st.session_state:
+        st.divider()
+        st.markdown("### Step 3 — Run Bias X-Ray")
+        _wc = st.session_state.get("_wiz_config")
+        if _wc and "pipeline_result" not in st.session_state:
+            st.markdown('<div class="glow-btn">', unsafe_allow_html=True)
+            if st.button("🔬 Run Bias X-Ray Now", use_container_width=True, key="wiz_run"):
+                with st.spinner("Running bias audit..."):
+                    try:
+                        from src.ml_pipeline.pipeline import run_full_pipeline
+                        _is_adult = st.session_state.get("_use_adult", False)
+                        _prep = None
+                        if _is_adult:
+                            from src.utils.adult_preprocessor import preprocess as _prep
+                        else:
+                            from src.utils.generic_preprocessor import preprocess_generic as _prep
+                        _wr = run_full_pipeline(
+                            st.session_state["raw_df"], _wc,
+                            run_mitigation=False, run_inprocessing=False,
+                            verbose=False, preprocess_fn=_prep,
+                        )
+                        st.session_state["pipeline_result"] = _wr
+                        st.session_state["_wiz_step"] = 4
+                        st.rerun()
+                    except Exception as _we:
+                        st.error(f"Pipeline error: {_we}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        elif "pipeline_result" in st.session_state:
+            _wr = st.session_state["pipeline_result"]
+            _wp = _wr.config.primary_protected_attr()
+            _wbm = _wr.baseline_eval.fairness.get(_wp) if _wr.baseline_eval else None
+            if _wbm:
+                _wdi = _wbm.disparate_impact
+                st.metric("Disparate Impact (primary attr)", f"{_wdi:.3f}",
+                          delta="⚠ Below legal threshold" if _wdi < 0.80 else "✅ Compliant",
+                          delta_color="inverse" if _wdi < 0.80 else "normal")
+            if st.button("Continue to Mitigation →", key="wiz_to_mit"):
+                st.session_state["_wiz_step"] = 4
+                st.rerun()
+
+    # --- Step 4: Mitigation ---
+    if _wiz_step >= 4 and "pipeline_result" in st.session_state:
+        st.divider()
+        st.markdown("### Step 4 — Apply Bias Mitigation")
+        _wr = st.session_state["pipeline_result"]
+        if _wr.preprocessed_eval is None:
+            if st.button("⚗️ Run Mitigation", use_container_width=True, key="wiz_mit"):
+                with st.spinner("Applying Reweighing..."):
+                    try:
+                        from src.ml_pipeline.pipeline import run_mitigation_steps
+                        _wr = run_mitigation_steps(_wr, run_inprocessing=False, verbose=False)
+                        st.session_state["pipeline_result"] = _wr
+                        st.session_state["_wiz_step"] = 5
+                        st.rerun()
+                    except Exception as _we:
+                        st.error(f"Mitigation error: {_we}")
+        else:
+            _wp = _wr.config.primary_protected_attr()
+            _pm = _wr.preprocessed_eval.fairness.get(_wp) if _wr.preprocessed_eval else None
+            if _pm:
+                st.metric("DI after Reweighing", f"{_pm.disparate_impact:.3f}",
+                          delta=f"{'✅ Fixed' if _pm.disparate_impact >= 0.80 else '⚠ Still low'}")
+            if st.button("Continue to Report →", key="wiz_to_rep"):
+                st.session_state["_wiz_step"] = 5
+                st.rerun()
+
+    # --- Step 5: Report ---
+    if _wiz_step >= 5 and "pipeline_result" in st.session_state:
+        st.divider()
+        st.markdown("### Step 5 — Generate Compliance Report")
+        st.info("Go to the **📄 Report** tab to generate a PDF and AI narrative, or use the Save button in the sidebar.")
+        if st.button("💾 Save Audit to History", key="wiz_save"):
+            try:
+                from src.utils.persistence import save_audit
+                _aid = save_audit(st.session_state["pipeline_result"])
+                st.success(f"Saved! Audit ID: {_aid[:24]}")
+            except Exception as _we:
+                st.error(f"Save failed: {_we}")
+
+    st.stop()   # Don't render tabs below in wizard mode
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -768,19 +1006,49 @@ with tab1:
     # Let the user pick any protected attribute — defaults to the most biased one
     _attr_options = result.config.protected_attrs
     _default_idx  = _attr_options.index(primary) if primary in _attr_options else 0
-    selected_metric_attr = st.selectbox(
-        "Show 6-metric breakdown for:",
-        options=_attr_options,
-        index=_default_idx,
-        key="six_metric_attr_selector",
-        help=(
-            "The most biased attribute is pre-selected. "
-            "Switch to inspect the full metric breakdown for any other protected attribute."
-        ),
-    )
+    _smcol1, _smcol2 = st.columns([3, 1])
+    with _smcol1:
+        selected_metric_attr = st.selectbox(
+            "Show 6-metric breakdown for:",
+            options=_attr_options,
+            index=_default_idx,
+            key="six_metric_attr_selector",
+            help=(
+                "The most biased attribute is pre-selected. "
+                "Switch to inspect the full metric breakdown for any other protected attribute."
+            ),
+        )
+    with _smcol2:
+        _show_ci = st.toggle("Show 95% CI", value=False, key="ci_toggle",
+                              help="Bootstrap 95% confidence intervals (500 resamples). Takes ~5s on first load.")
+
     _bm_selected = result.baseline_eval.fairness.get(selected_metric_attr) if result.baseline_eval else None
     if _bm_selected:
-        show_six_metric_table(_bm_selected, selected_metric_attr)
+        # V2: compute bootstrap CI on demand
+        _ci_computed = st.session_state.get(f"_ci_{selected_metric_attr}")
+        if _show_ci and _ci_computed is None:
+            with st.spinner("Computing bootstrap confidence intervals (500 resamples)..."):
+                try:
+                    from src.bias_engine.detector import compute_bootstrap_ci
+                    _ci_result = compute_bootstrap_ci(result._df_clean, result.config,
+                                                       y_pred=None, attr=selected_metric_attr)
+                    st.session_state[f"_ci_{selected_metric_attr}"] = _ci_result
+                    _ci_computed = _ci_result
+                except Exception as _ce:
+                    st.caption(f"CI computation unavailable: {_ce}")
+
+        # Attach CI fields to _bm_selected if available
+        if _show_ci and _ci_computed is not None:
+            for _ci_field in ["ci_disparate_impact","ci_statistical_parity_diff",
+                               "ci_equalized_odds_diff","ci_equal_opportunity_diff",
+                               "ci_predictive_parity_diff","ci_fnr_parity_diff"]:
+                if hasattr(_ci_computed, _ci_field):
+                    try:
+                        setattr(_bm_selected, _ci_field, getattr(_ci_computed, _ci_field))
+                    except Exception:
+                        pass
+
+        show_six_metric_table(_bm_selected, selected_metric_attr, show_ci=_show_ci)
     else:
         st.info(f"No metrics available for **{selected_metric_attr}**.")
 
@@ -800,10 +1068,13 @@ with tab1:
         st.warning(f"**{len(flagged)} shadow proxy feature(s) detected** — removing the protected "
                    "attribute alone will NOT eliminate bias.")
         proxy_df = pd.DataFrame([{
-            "Feature":        r.feature,
-            "Protected Attr": r.protected_attr,
-            "Mutual Info":    round(r.mutual_info, 4),
-            "Risk Level":     r.risk_level,
+            "Feature":           r.feature,
+            "Protected Attr":    r.protected_attr,
+            "Combined Score":    round(getattr(r, "combined_score", r.mutual_info), 4),
+            "Mutual Info":       round(r.mutual_info, 4),
+            "Cramér V":          round(getattr(r, "cramers_v", float("nan")), 4)
+                                 if not np.isnan(getattr(r, "cramers_v", float("nan"))) else "—",
+            "Risk Level":        r.risk_level,
             "Recommended Action": r.action,
         } for r in flagged])
         st.dataframe(proxy_df, use_container_width=True, hide_index=True,
@@ -813,8 +1084,8 @@ with tab1:
             fig_hm = px.imshow(
                 hm_data.head(15), text_auto=".3f",
                 color_continuous_scale=[[0,"#0d1117"],[0.5,"#7c3aed"],[1,"#dc2626"]],
-                title="Mutual Information Heatmap — Features vs Protected Attributes",
-                labels=dict(color="MI Score"),
+                title="Combined Risk Score Heatmap — Features vs Protected Attributes (V2: MI + Cramér V + PBR)",
+                labels=dict(color="Combined Score"),
             )
             fig_hm.update_layout(**DARK_LAYOUT)
             st.plotly_chart(fig_hm, use_container_width=True, config={"displayModeBar": False})
@@ -1179,6 +1450,8 @@ with tab3:
         "The bar chart shows the <b>mean absolute SHAP value</b> — how much each feature moves the prediction on average. "
         "<b>If a protected attribute appears near the top, bias leakage is confirmed.</b>"
     )
+    # V2: use pre-computed SHAP from pipeline if available
+    _pipeline_shap = getattr(result, "shap_importance", None)
     try:
         from src.explainability.shap_explainer import (
             build_explainer, compute_global_shap, global_feature_importance, protected_attr_in_top_n
@@ -1188,12 +1461,17 @@ with tab3:
         feat_names = result.baseline_train.feature_names
 
         if "shap_importance" not in st.session_state:
-            with st.spinner("Computing SHAP values (one-time, ~15 seconds)..."):
-                exp = build_explainer(model, X_test)
-                sv, fnames = compute_global_shap(exp, X_test, max_samples=300)
-                st.session_state["shap_importance"] = global_feature_importance(sv, fnames)
-                st.session_state["shap_explainer"]  = exp
-                st.session_state["feat_names"]      = fnames
+            if _pipeline_shap is not None:
+                st.session_state["shap_importance"] = _pipeline_shap
+                st.session_state["shap_explainer"]  = getattr(result, "shap_explainer", None)
+                st.session_state["feat_names"]      = feat_names
+            else:
+                with st.spinner("Computing SHAP values (one-time, ~15 seconds)..."):
+                    exp = build_explainer(model, X_test)
+                    sv, fnames = compute_global_shap(exp, X_test, max_samples=300)
+                    st.session_state["shap_importance"] = global_feature_importance(sv, fnames)
+                    st.session_state["shap_explainer"]  = exp
+                    st.session_state["feat_names"]      = fnames
 
         imp = st.session_state["shap_importance"]
         prot_cols = result.config.protected_attrs + [f"{a}_binary" for a in result.config.protected_attrs]
@@ -1216,6 +1494,57 @@ with tab3:
             xaxis_title="Mean |SHAP value|", **DARK_LAYOUT, height=380,
         )
         st.plotly_chart(fig_shap, use_container_width=True, config={"displayModeBar": False})
+
+        # ── V2: Group SHAP Comparison ──────────────────────────────────────────
+        st.divider()
+        section("V2: Group SHAP Comparison — Privileged vs Unprivileged")
+        hint(
+            "Same model, different populations. <b>Do different demographic groups rely on different features?</b> "
+            "If the top features differ between privileged and unprivileged groups, the model has learned "
+            "group-specific decision patterns — a sign of structural bias even when DI looks acceptable."
+        )
+        try:
+            _exp = st.session_state.get("shap_explainer")
+            if _exp is None and result.baseline_train:
+                _exp = build_explainer(model, X_test)
+                st.session_state["shap_explainer"] = _exp
+
+            if _exp is not None:
+                _primary_col = primary if primary in X_test.columns else f"{primary}_binary"
+                _priv_val    = result.config.privileged_values.get(primary)
+                _priv_mask   = (X_test[_primary_col].astype(str) == str(_priv_val)).values if _primary_col in X_test.columns else None
+
+                if _priv_mask is not None and _priv_mask.sum() >= 10 and (~_priv_mask).sum() >= 10:
+                    _X_priv   = X_test[_priv_mask]
+                    _X_unpriv = X_test[~_priv_mask]
+                    _sv_p, _fn = compute_global_shap(_exp, _X_priv,   max_samples=min(150, len(_X_priv)))
+                    _sv_u, _   = compute_global_shap(_exp, _X_unpriv, max_samples=min(150, len(_X_unpriv)))
+                    _imp_p = global_feature_importance(_sv_p, _fn).head(10).set_index("feature")["importance"]
+                    _imp_u = global_feature_importance(_sv_u, _fn).head(10).set_index("feature")["importance"]
+                    _all_feats = sorted(set(_imp_p.index) | set(_imp_u.index),
+                                        key=lambda f: -(_imp_p.get(f, 0) + _imp_u.get(f, 0)))[:10]
+                    fig_gcmp = go.Figure()
+                    fig_gcmp.add_trace(go.Bar(
+                        name="Privileged", x=_all_feats,
+                        y=[float(_imp_p.get(f, 0)) for f in _all_feats],
+                        marker_color="#7c3aed", opacity=0.85,
+                    ))
+                    fig_gcmp.add_trace(go.Bar(
+                        name="Unprivileged", x=_all_feats,
+                        y=[float(_imp_u.get(f, 0)) for f in _all_feats],
+                        marker_color="#f59e0b", opacity=0.85,
+                    ))
+                    fig_gcmp.update_layout(
+                        barmode="group",
+                        title=f"SHAP Feature Importance by Group ({_primary_col})",
+                        yaxis_title="Mean |SHAP|", **DARK_LAYOUT, height=380,
+                    )
+                    st.plotly_chart(fig_gcmp, use_container_width=True, config={"displayModeBar": False})
+                else:
+                    st.caption("Not enough samples in one group for SHAP group comparison.")
+        except Exception as _ge:
+            st.caption(f"Group SHAP comparison unavailable: {_ge}")
+
     except Exception as e:
         st.warning(f"SHAP computation unavailable: {e}")
 
@@ -1399,8 +1728,16 @@ with tab4:
         inter = st.session_state["inter_results"]
 
     if not inter:
-        st.warning("Not enough data for intersectional analysis (need ≥30 samples per intersectional group).")
+        st.warning("Not enough data for intersectional analysis (need ≥5 samples per intersectional group).")
         st.stop()
+
+    # V2: count small-sample groups (5-29 rows)
+    _n_small = sum(1 for r in inter if getattr(r, "small_sample_warning", False))
+    if _n_small > 0:
+        st.info(
+            f"**{_n_small} small group(s) included with caution** — sample size 5–29. "
+            "Wilson 95% confidence intervals are shown. Interpret these results carefully."
+        )
 
     n_crit = sum(1 for r in inter if r.severity == "CRITICAL")
     n_high = sum(1 for r in inter if r.severity == "HIGH")
@@ -1504,16 +1841,28 @@ with tab4:
     rows = []
     for r in inter:
         ibi_contrib = round((1 - min(r.disparate_impact, 1.0)) * r.group_size / max(total_weight, 1) * 100, 2) if not np.isnan(r.disparate_impact) else 0
+        _ci_lo = getattr(r, "approval_rate_ci_lower", float("nan"))
+        _ci_hi = getattr(r, "approval_rate_ci_upper", float("nan"))
+        _small = getattr(r, "small_sample_warning", False)
+        _ci_str = f"[{_ci_lo:.2f}, {_ci_hi:.2f}]" if not (np.isnan(_ci_lo) or np.isnan(_ci_hi)) else "—"
         rows.append({
-            "Group":            r.group_label,
-            "Size":             r.group_size,
-            "Approval Rate":    f"{r.approval_rate:.1%}",
-            "Disparate Impact": round(r.disparate_impact, 3),
-            "EOppD":            round(r.equal_opportunity_diff, 3) if not np.isnan(r.equal_opportunity_diff) else "—",
-            "IBI Contribution": f"{ibi_contrib:.2f}%",
-            "Severity":         r.severity,
+            "Group":              r.group_label,
+            "Size":               r.group_size,
+            "Approval Rate":      f"{r.approval_rate:.1%}",
+            "95% CI (Approval)":  _ci_str if _small else "—",
+            "⚠ Small":            "⚠" if _small else "",
+            "Disparate Impact":   round(r.disparate_impact, 3),
+            "EOppD":              round(r.equal_opportunity_diff, 3) if not np.isnan(r.equal_opportunity_diff) else "—",
+            "IBI Contribution":   f"{ibi_contrib:.2f}%",
+            "Severity":           r.severity,
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                 column_config={
+                     "95% CI (Approval)": st.column_config.TextColumn(width="medium",
+                                                                        help="Wilson 95% CI for approval rate (shown for groups with n=5–29 only)"),
+                     "⚠ Small": st.column_config.TextColumn(width="small",
+                                                              help="Group has 5–29 samples — treat with caution"),
+                 })
 
     if worst.severity in ("CRITICAL", "HIGH"):
         st.error(
@@ -1522,6 +1871,180 @@ with tab4:
             f"Approval rate: {worst.approval_rate:.1%}. "
             "A standard single-attribute audit would have missed this compounding effect."
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4b — CAUSAL FAIRNESS (V2 NEW)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4b:
+    st.markdown("## 🔬 Causal Fairness — Direct vs Indirect Discrimination")
+    hint(
+        "<b>Why causal analysis?</b> Standard fairness metrics tell you <i>that</i> a disparity exists, "
+        "not <i>why</i>. Causal mediation analysis decomposes the total effect of a protected attribute "
+        "into <b>direct discrimination</b> (A→Y) and <b>indirect discrimination</b> (A→M→Y, through mediators "
+        "like occupation or zip code). The EU AI Act and ECOA increasingly expect this level of root-cause analysis."
+    )
+
+    if "pipeline_result" not in st.session_state:
+        st.info("Complete the Bias X-Ray first (Tab 1).")
+        st.stop()
+
+    result  = st.session_state["pipeline_result"]
+    primary = result.config.primary_protected_attr()
+
+    # ── Configuration ──────────────────────────────────────────────────────────
+    section("⚙️ Configure Causal Analysis")
+    _cf_attr = st.selectbox(
+        "Protected attribute to analyse causally:",
+        options=result.config.protected_attrs,
+        index=0,
+        key="causal_attr",
+        help="The protected attribute whose effect on the outcome you want to decompose."
+    )
+
+    if result._df_clean is not None:
+        _candidate_cols = [c for c in result._df_clean.columns
+                           if c not in result.config.protected_attrs
+                           and c != result.config.target_col]
+        _auto_meds = [c for c in _candidate_cols
+                      if result._df_clean[c].dtype != object
+                      and result._df_clean[c].nunique() <= 20][:6]
+    else:
+        _candidate_cols, _auto_meds = [], []
+
+    _sel_meds = st.multiselect(
+        "Mediator candidates (features that may transmit bias):",
+        options=_candidate_cols,
+        default=_auto_meds[:4],
+        key="causal_meds",
+        help="Features that plausibly lie on the causal path from the protected attribute to the outcome. E.g. occupation → income."
+    )
+
+    _confounders = st.multiselect(
+        "Confounders to control for (optional):",
+        options=[c for c in _candidate_cols if c not in _sel_meds],
+        default=[],
+        key="causal_confounders",
+        help="Variables that affect both the protected attribute and the outcome but are NOT mediators."
+    )
+
+    st.markdown('<div class="glow-btn">', unsafe_allow_html=True)
+    _run_causal = st.button("🔬 Run Causal Mediation Analysis", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if _run_causal:
+        with st.spinner("Running Baron-Kenny mediation analysis..."):
+            try:
+                from src.bias_engine.causal_fairness import run_causal_analysis
+                _causal_report = run_causal_analysis(
+                    result._df_clean, result.config,
+                    attr=_cf_attr,
+                    mediators=_sel_meds if _sel_meds else None,
+                    confounders=_confounders if _confounders else None,
+                )
+                st.session_state["causal_report"] = _causal_report
+                st.success("Causal analysis complete!")
+            except Exception as _ce:
+                st.error(f"Causal analysis error: {_ce}")
+                import traceback; st.code(traceback.format_exc())
+
+    if "causal_report" in st.session_state:
+        _cr = st.session_state["causal_report"]
+
+        # ── Summary ────────────────────────────────────────────────────────────
+        section("📋 Summary")
+        st.markdown(
+            f'<div class="hint-box">{_cr.summary}</div>',
+            unsafe_allow_html=True
+        )
+
+        if not _cr.paths:
+            st.info("No mediation paths could be estimated with the selected configuration.")
+            st.stop()
+
+        # ── Dominant path metrics ───────────────────────────────────────────────
+        if _cr.dominant_path:
+            _dp = _cr.dominant_path
+            _dm1, _dm2, _dm3, _dm4 = st.columns(4)
+            _dm1.metric("Total Effect",    f"{_dp.total_effect:.3f}",
+                        help="Overall effect of the protected attribute on the outcome (ignoring mediators).")
+            _dm2.metric("Direct Effect",   f"{_dp.direct_effect:.3f}",
+                        help="Effect of the protected attribute that is NOT explained by mediators. Direct discrimination.")
+            _dm3.metric("Indirect Effect", f"{_dp.indirect_effect:.3f}",
+                        help=f"Effect transmitted through '{_dp.mediator}'. Indirect/structural discrimination.")
+            _pct = _dp.percent_mediated
+            _dm4.metric("% Mediated",
+                        f"{abs(_pct):.1f}%" if not np.isnan(_pct) else "—",
+                        help="Fraction of the total effect that runs through the mediator pathway.")
+
+        # ── Waterfall chart: direct vs indirect per mediator ───────────────────
+        section("Effect Decomposition per Mediator")
+        hint(
+            "Each row is a different mediator. <b>Purple = direct effect</b> (A→Y, not through mediator). "
+            "<b>Orange = indirect effect</b> (A→M→Y, through mediator). "
+            "A large orange bar means the disparity is transmitted structurally — "
+            "fixing the mediator (e.g. changing occupational sorting) would reduce the bias."
+        )
+        from src.bias_engine.causal_fairness import causal_waterfall_data
+        _wf_df = causal_waterfall_data(_cr)
+        if not _wf_df.empty:
+            _fig_wf = go.Figure()
+            _fig_wf.add_trace(go.Bar(
+                name="Direct Effect",
+                x=_wf_df["mediator"],
+                y=_wf_df["direct_effect"].round(4),
+                marker_color="#7c3aed", opacity=0.85,
+                text=[f"{v:.3f}" for v in _wf_df["direct_effect"]], textposition="outside",
+            ))
+            _fig_wf.add_trace(go.Bar(
+                name="Indirect Effect (via mediator)",
+                x=_wf_df["mediator"],
+                y=_wf_df["indirect_effect"].round(4),
+                marker_color="#f59e0b", opacity=0.85,
+                text=[f"{v:.3f}" for v in _wf_df["indirect_effect"]], textposition="outside",
+            ))
+            _fig_wf.update_layout(
+                barmode="group", title="Direct vs Indirect Effect Decomposition by Mediator",
+                yaxis_title="Effect Size (OLS coefficient)", **DARK_LAYOUT, height=380,
+            )
+            st.plotly_chart(_fig_wf, use_container_width=True, config={"displayModeBar": False})
+
+        # ── Sobel test table ────────────────────────────────────────────────────
+        section("Sobel Test Results — Statistical Significance of Indirect Paths")
+        hint(
+            "The Sobel test assesses whether the indirect effect (A→M→Y) is statistically significant. "
+            "<b>p &lt; 0.05</b> = the indirect path is real, not sampling noise. "
+            "High % mediated + low p-value = strong evidence of structural/indirect discrimination."
+        )
+        _sobel_rows = []
+        for _p in _cr.paths:
+            _sobel_rows.append({
+                "Mediator":        _p.mediator,
+                "Total Effect":    round(_p.total_effect, 4),
+                "Direct Effect":   round(_p.direct_effect, 4),
+                "Indirect Effect": round(_p.indirect_effect, 4),
+                "Sobel Z":         round(_p.sobel_z, 3) if not np.isnan(_p.sobel_z) else "—",
+                "Sobel p":         round(_p.sobel_p, 4) if not np.isnan(_p.sobel_p) else "—",
+                "% Mediated":      f"{abs(_p.percent_mediated):.1f}%" if not np.isnan(_p.percent_mediated) else "—",
+                "n":               _p.n_samples,
+                "Significant":     "✅" if (not np.isnan(_p.sobel_p) and _p.sobel_p < 0.05) else "—",
+            })
+        st.dataframe(pd.DataFrame(_sobel_rows), use_container_width=True, hide_index=True)
+
+        # ── Per-path interpretation ─────────────────────────────────────────────
+        with st.expander("View plain-English interpretation per mediator"):
+            for _p in _cr.paths:
+                st.markdown(f"**{_p.mediator}**: {_p.interpretation}")
+
+    else:
+        st.markdown("""
+        <div style="text-align:center;padding:3rem;color:#6b7280">
+          <div style="font-size:2.5rem">🔬</div>
+          <div style="font-size:1rem;margin-top:0.5rem">
+            Configure mediators above and click <b style="color:#a78bfa">Run Causal Mediation Analysis</b>.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1560,6 +2083,9 @@ with tab5:
 
     n_sample = min(500, len(X_test))
 
+    # V2: label decode map for string labels in CF display
+    _label_decode = getattr(result, "label_decode", {})
+
     if st.button(f"▶ Run Batch Check ({n_sample} rows)", key="batch_cf_btn"):
         with st.spinner(f"Running counterfactual check on {n_sample} rows..."):
             try:
@@ -1572,15 +2098,18 @@ with tab5:
                     input_dict = row.to_dict()
                     cf = run_counterfactual_check(
                         model, input_dict, result.config, feat_names,
-                        attr=primary_feat
+                        attr=primary_feat, label_decode=_label_decode,
                     )
+                    _orig_str = getattr(cf, "original_label_str", str(cf.original_value))
+                    _flip_str = getattr(cf, "flipped_label_str",  str(cf.flipped_value))
                     cf_results.append({
-                        "row_idx":         idx,
-                        "risk_level":      cf.risk_level,
+                        "row_idx":           idx,
+                        "risk_level":        cf.risk_level,
                         "original_decision": cf.original_decision,
-                        "cf_decision":     cf.counterfactual_decision,
-                        "confidence_delta": round(cf.confidence_delta, 3),
-                        "is_fair":         cf.is_fair,
+                        "cf_decision":       cf.counterfactual_decision,
+                        "flip":              f"{_orig_str} → {_flip_str}",
+                        "confidence_delta":  round(cf.confidence_delta, 3),
+                        "is_fair":           cf.is_fair,
                     })
 
                 cf_df = pd.DataFrame(cf_results)
@@ -1635,9 +2164,11 @@ with tab5:
         # Table of critical rows
         critical_rows = cf_df[cf_df["risk_level"] == "CRITICAL"].head(20)
         if not critical_rows.empty:
+            _show_cols = [c for c in ["row_idx","flip","original_decision","cf_decision","confidence_delta"] if c in cf_df.columns]
             with st.expander(f"View CRITICAL rows (first 20 of {n_critical})"):
-                st.dataframe(critical_rows[["row_idx","original_decision","cf_decision","confidence_delta"]].rename(
-                    columns={"row_idx":"Row","original_decision":"Original","cf_decision":"After Flip","confidence_delta":"Conf Delta"}
+                st.dataframe(critical_rows[_show_cols].rename(
+                    columns={"row_idx":"Row","flip":"Demographic Flip","original_decision":"Original",
+                             "cf_decision":"After Flip","confidence_delta":"Conf Delta"}
                 ), use_container_width=True, hide_index=True)
 
     st.divider()
@@ -1681,7 +2212,12 @@ with tab5:
             pred = int(model.predict(row_df)[0])
             conf = 1.0
 
-        cf = run_counterfactual_check(model, input_dict, result.config, feat_names, attr=primary_feat)
+        cf = run_counterfactual_check(model, input_dict, result.config, feat_names,
+                                       attr=primary_feat, label_decode=_label_decode)
+
+        # V2: use string labels for demographic flip display
+        _orig_str = getattr(cf, "original_label_str", str(cf.original_value))
+        _flip_str = getattr(cf, "flipped_label_str",  str(cf.flipped_value))
 
         orig_label = "Approved" if pred == 1 else "Denied"
         orig_color = "#16a34a"  if pred == 1 else "#dc2626"
@@ -1696,7 +2232,7 @@ with tab5:
             <div style="background:#161b22;border-radius:12px;padding:1.2rem;border:1px solid #30363d;text-align:center">
               <div style="color:#8b949e;font-size:0.85rem;margin-bottom:0.3rem">ORIGINAL PREDICTION</div>
               <div style="font-size:2rem;font-weight:700;color:{orig_color}">{orig_label}</div>
-              <div style="color:#8b949e;margin-top:0.4rem">{primary_feat} = <b style="color:#e6edf3">{input_dict.get(primary_feat, '?')}</b></div>
+              <div style="color:#8b949e;margin-top:0.4rem">{primary_feat} = <b style="color:#e6edf3">{_orig_str}</b></div>
               <div style="color:#8b949e">Confidence: <b style="color:#e6edf3">{conf:.1%}</b></div>
             </div>
             """, unsafe_allow_html=True)
@@ -1710,7 +2246,7 @@ with tab5:
               <div style="color:#8b949e;font-size:0.85rem;margin-bottom:0.3rem">GHOST CHECK</div>
               <div style="font-size:2rem;font-weight:700;color:{rc}">{ri} {cf.risk_level}</div>
               <div style="color:#c9d1d9;margin-top:0.4rem;font-size:0.88rem">{flip_msg}</div>
-              <div style="color:#8b949e;font-size:0.8rem;margin-top:0.3rem">Flipped {primary_feat}: {cf.original_value} → {cf.flipped_value}</div>
+              <div style="color:#8b949e;font-size:0.8rem;margin-top:0.3rem">Flipped {primary_feat}: <b>{_orig_str} → {_flip_str}</b></div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1775,6 +2311,7 @@ with tab6:
 
     if run_ghost:
         from src.bias_engine.counterfactual import run_counterfactual_check
+        _ghost_label_decode = getattr(result, "label_decode", {})
         row = pd.DataFrame([{f: input_vals.get(f, 0) for f in feat_names}])
 
         if hasattr(model, "predict_proba"):
@@ -1788,7 +2325,10 @@ with tab6:
         decision       = "✅ Approved" if pred == 1 else "❌ Denied"
         decision_color = "#16a34a"     if pred == 1 else "#dc2626"
 
-        cf = run_counterfactual_check(model, input_vals, result.config, feat_names, attr=primary_feat)
+        cf = run_counterfactual_check(model, input_vals, result.config, feat_names,
+                                       attr=primary_feat, label_decode=_ghost_label_decode)
+        _g_orig_str = getattr(cf, "original_label_str", str(cf.original_value))
+        _g_flip_str = getattr(cf, "flipped_label_str",  str(cf.flipped_value))
 
         res_col, cf_col = st.columns(2)
         with res_col:
@@ -1797,6 +2337,7 @@ with tab6:
               <div style="color:#8b949e;font-size:0.85rem;margin-bottom:0.3rem">MODEL DECISION</div>
               <div style="font-size:2.2rem;font-weight:700;color:{decision_color}">{decision}</div>
               <div style="color:#8b949e;margin-top:0.5rem">Confidence: <b style="color:#e6edf3">{conf:.1%}</b></div>
+              <div style="color:#8b949e">{primary_feat}: <b style="color:#a78bfa">{_g_orig_str}</b></div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1809,7 +2350,7 @@ with tab6:
                 msg = f"Same decision but confidence <b>drops {cf.confidence_delta:.0%}</b> on demographic swap. Recommend manual review."
             else:
                 color, icon, label = "#dc2626", "🚨", "CRITICAL"
-                msg = f"Decision <b>FLIPS</b> when {primary_feat} changes. This is direct individual-level discrimination."
+                msg = f"Decision <b>FLIPS</b> when {primary_feat} changes (<b>{_g_orig_str} → {_g_flip_str}</b>). Direct individual-level discrimination."
 
             st.markdown(f"""
             <div style="background:#161b22;border-radius:12px;padding:1.2rem;border:2px solid {color};text-align:center">
@@ -1854,31 +2395,61 @@ with tab6:
             st.caption(f"SHAP explanation unavailable: {e}")
 
         st.divider()
-        gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        if gemini_key:
-            if st.button("✨ Generate Plain-English Explanation (Gemini AI)"):
-                with st.spinner("Asking Gemini..."):
+        _g_prov = st.session_state.get("_llm_provider", "gemini")
+        _g_key  = st.session_state.get("_llm_api_key", "")
+        _g_has  = (_g_prov in ("gemini","openai","claude") and bool(_g_key)) or _g_prov == "ollama"
+        if _g_has or _g_prov == "none":
+            if st.button(f"✨ Generate Plain-English Explanation ({_g_prov.title()})"):
+                with st.spinner(f"Asking {_g_prov.title()}..."):
                     try:
-                        import google.generativeai as genai
-                        genai.configure(api_key=gemini_key)
-                        gm = genai.GenerativeModel("gemini-2.0-flash")
                         try:
                             top3 = [(f, round(v, 3)) for f, _, v in drivers[:3]]
                         except Exception:
                             top3 = []
-                        prompt = (
+                        _cf_msg = getattr(cf, "message", cf.risk_level)
+                        _expl_prompt = (
                             f"A prediction model decided: {decision} (confidence {conf:.0%}).\n"
                             f"Top factors: {top3}.\n"
-                            f"Counterfactual Ghost result: {cf.risk_level} — {cf.message}\n\n"
+                            f"Counterfactual Ghost result: {cf.risk_level} — {_cf_msg}\n"
+                            f"Demographic flip: {_g_orig_str} → {_g_flip_str}.\n\n"
                             "Explain this decision in 2 plain sentences a non-technical person could understand. "
                             "Then explain what the Counterfactual Ghost result means for fairness in one sentence."
                         )
-                        resp = gm.generate_content(prompt)
-                        st.info(resp.text)
-                    except Exception as e:
-                        st.warning(f"Gemini error: {e}")
+                        if _g_prov == "gemini":
+                            import google.generativeai as genai
+                            genai.configure(api_key=_g_key)
+                            gm = genai.GenerativeModel("gemini-2.0-flash")
+                            st.info(gm.generate_content(_expl_prompt).text)
+                        elif _g_prov == "openai":
+                            from openai import OpenAI
+                            _cl = OpenAI(api_key=_g_key)
+                            _resp = _cl.chat.completions.create(
+                                model="gpt-4o-mini",
+                                messages=[{"role":"user","content":_expl_prompt}],
+                                temperature=0.3,
+                            )
+                            st.info(_resp.choices[0].message.content.strip())
+                        elif _g_prov == "claude":
+                            import anthropic
+                            _cl = anthropic.Anthropic(api_key=_g_key)
+                            _msg = _cl.messages.create(
+                                model="claude-sonnet-4-6", max_tokens=512,
+                                messages=[{"role":"user","content":_expl_prompt}],
+                            )
+                            st.info(_msg.content[0].text.strip())
+                        elif _g_prov == "ollama":
+                            import requests as _req, json as _json
+                            _ollurl = st.session_state.get("_llm_ollama_url","http://localhost:11434")
+                            _r = _req.post(f"{_ollurl}/api/chat",
+                                           json={"model":"llama3","messages":[{"role":"user","content":_expl_prompt}],"stream":False},
+                                           timeout=60)
+                            st.info(_r.json()["message"]["content"])
+                        else:
+                            st.info(_expl_prompt)
+                    except Exception as _ge:
+                        st.warning(f"{_g_prov} error: {_ge}")
         else:
-            hint("Add your free Gemini API key in the sidebar to get plain-English explanations of any prediction.")
+            hint(f"Set an API key for <b>{_g_prov}</b> in the sidebar to get plain-English explanations of any prediction.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1906,9 +2477,12 @@ with tab7:
         "<b>This is what a compliance officer needs to sign off on AI deployment.</b>"
     )
 
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    prov       = st.session_state.get("provenance")
-    best_eval  = result.inprocessed_eval or result.preprocessed_eval
+    # V2: multi-provider LLM
+    _llm_prov    = st.session_state.get("_llm_provider", "gemini")
+    _llm_key     = st.session_state.get("_llm_api_key", "")
+    _llm_ollama  = st.session_state.get("_llm_ollama_url", "http://localhost:11434")
+    prov         = st.session_state.get("provenance")
+    best_eval    = result.inprocessed_eval or result.preprocessed_eval
 
     if "narrative" not in st.session_state and prov and best_eval:
         from src.narrative.llm_narrator import _fallback_narrative
@@ -1917,19 +2491,31 @@ with tab7:
         from src.narrative.llm_narrator import _fallback_narrative
         st.session_state["narrative"] = _fallback_narrative(result.baseline_eval, result.baseline_eval, primary, prov)
 
-    if gemini_key:
-        if st.button("✨ Generate Narrative with Gemini AI", use_container_width=True):
+    _has_llm = (_llm_prov in ("gemini","openai","claude") and bool(_llm_key)) or _llm_prov == "ollama"
+    _btn_label = {
+        "gemini": "✨ Generate Narrative with Gemini AI",
+        "openai": "✨ Generate Narrative with OpenAI",
+        "claude": "✨ Generate Narrative with Claude",
+        "ollama": "✨ Generate Narrative with Ollama (local)",
+        "none":   "✨ Generate Rule-Based Narrative",
+    }.get(_llm_prov, "✨ Generate Narrative")
+
+    if _has_llm or _llm_prov == "none":
+        if st.button(_btn_label, use_container_width=True):
             if prov:
                 from src.narrative.llm_narrator import stream_audit_narrative
                 from src.bias_engine.proxy_scanner import get_flagged_proxies
                 flagged = get_flagged_proxies(result.proxy_scan)
                 eval_for_narr = best_eval or result.baseline_eval
-                with st.spinner("Gemini is writing your compliance narrative..."):
+                with st.spinner(f"{_llm_prov.title()} is writing your compliance narrative..."):
                     narrative = ""
                     box = st.empty()
                     for chunk in stream_audit_narrative(
                         result.baseline_eval, eval_for_narr, flagged, prov,
-                        result.dataset_name, primary
+                        result.dataset_name, primary,
+                        provider=_llm_prov,
+                        api_key=_llm_key or None,
+                        ollama_base_url=_llm_ollama,
                     ):
                         narrative += chunk
                         box.markdown(narrative)
@@ -1938,8 +2524,8 @@ with tab7:
             else:
                 st.warning("Run Tab 1 first to generate provenance data.")
     else:
-        hint("No Gemini API key set — showing auto-generated rule-based narrative. "
-             "Add a free key in the sidebar for an AI-written version.")
+        hint(f"No API key set for <b>{_llm_prov}</b> — showing auto-generated rule-based narrative. "
+             "Add your key or switch provider in the sidebar.")
 
     if "narrative" in st.session_state:
         st.markdown("""

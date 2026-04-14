@@ -1,6 +1,12 @@
 """
 Bias Detection Engine — computes 6 standard fairness metrics.
 
+V2 additions:
+  - ConfidenceInterval dataclass
+  - Bootstrap CI on DI, SPD, EOD, EOpD, PP, FNRP
+  - compute_bootstrap_ci() standalone function
+  - MetricsResult extended with optional ci_* fields
+
 Pre-training metrics (need only df + config):
   - Disparate Impact (DI)
   - Statistical Parity Difference (SPD)
@@ -25,6 +31,21 @@ EOD_THRESHOLD    = 0.10   # above = FAIL
 EOPD_THRESHOLD   = 0.10   # above = FAIL
 PP_THRESHOLD     = 0.10   # above = FAIL
 FNRP_THRESHOLD   = 0.10   # above = FAIL
+
+
+@dataclass
+class ConfidenceInterval:
+    """95% bootstrap confidence interval for a single metric."""
+    lower: float
+    upper: float
+    level: float = 0.95
+
+    def contains(self, threshold: float) -> bool:
+        """True if the threshold falls inside the CI — metric is borderline."""
+        return self.lower <= threshold <= self.upper
+
+    def __str__(self) -> str:
+        return f"[{self.lower:.3f}, {self.upper:.3f}]"
 
 
 @dataclass
@@ -53,12 +74,28 @@ class MetricsResult:
     failures: list[str] = field(default_factory=list)
     severity: str = "UNKNOWN"   # CLEAR / WARNING / CRITICAL
 
+    # V2: Bootstrap confidence intervals (None = not computed)
+    ci_disparate_impact: ConfidenceInterval | None = None
+    ci_statistical_parity_diff: ConfidenceInterval | None = None
+    ci_equalized_odds_diff: ConfidenceInterval | None = None
+    ci_equal_opportunity_diff: ConfidenceInterval | None = None
+    ci_predictive_parity_diff: ConfidenceInterval | None = None
+    ci_fnr_parity_diff: ConfidenceInterval | None = None
+
+    def has_ci(self) -> bool:
+        return self.ci_disparate_impact is not None
+
+    def is_borderline_di(self) -> bool:
+        """True if the DI CI straddles the legal threshold — statistically uncertain."""
+        if self.ci_disparate_impact:
+            return self.ci_disparate_impact.contains(DI_THRESHOLD)
+        return False
+
 
 def _coerce_priv_val(col: pd.Series, priv_val: object) -> object:
     """
     Cast priv_val to match the dtype of col so that equality comparisons work
     even when the UI always stores values as strings but the column is numeric.
-    E.g. col dtype=int64, priv_val="23" → returns 23 (int).
     """
     if not pd.api.types.is_object_dtype(col) and not pd.api.types.is_string_dtype(col):
         try:
@@ -110,9 +147,9 @@ def _confusion_rates(y_true: pd.Series, y_pred: np.ndarray, pos_label: int = 1):
     tn = ((y_pred != pos_label) & (y_true != pos_label)).sum()
     fn = ((y_pred != pos_label) & (y_true == pos_label)).sum()
 
-    tpr = tp / (tp + fn) if (tp + fn) > 0 else float("nan")  # recall
+    tpr = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
     fpr = fp / (fp + tn) if (fp + tn) > 0 else float("nan")
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else float("nan")  # precision
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
     fnr = fn / (tp + fn) if (tp + fn) > 0 else float("nan")
     return tpr, fpr, ppv, fnr
 
@@ -128,13 +165,10 @@ def compute_all_metrics(
 
     Parameters
     ----------
-    df : pd.DataFrame
-        Must contain protected attr column and target column (true labels).
-    config : DatasetConfig
-    y_pred : np.ndarray, optional
-        Model predictions. Required for post-training metrics.
-    attr : str, optional
-        Which protected attribute to analyse. Defaults to the primary one.
+    df      : Must contain protected attr column and target column (true labels).
+    config  : DatasetConfig
+    y_pred  : Model predictions. Required for post-training metrics.
+    attr    : Which protected attribute to analyse. Defaults to the primary one.
     """
     attr = attr or config.primary_protected_attr()
     priv_val = _coerce_priv_val(df[attr], config.privileged_values[attr])
@@ -164,15 +198,14 @@ def compute_all_metrics(
         priv_pred   = y_pred[priv_mask.values]
         unpriv_pred = y_pred[~priv_mask.values]
 
-        tpr_p,  fpr_p,  ppv_p,  fnr_p  = _confusion_rates(priv_y,   priv_pred,   config.positive_label)
-        tpr_u,  fpr_u,  ppv_u,  fnr_u  = _confusion_rates(unpriv_y, unpriv_pred, config.positive_label)
+        tpr_p, fpr_p, ppv_p, fnr_p = _confusion_rates(priv_y,   priv_pred,   config.positive_label)
+        tpr_u, fpr_u, ppv_u, fnr_u = _confusion_rates(unpriv_y, unpriv_pred, config.positive_label)
 
         result.equalized_odds_diff    = float(max(abs(tpr_p - tpr_u), abs(fpr_p - fpr_u)))
         result.equal_opportunity_diff = float(abs(tpr_p - tpr_u))
-        result.predictive_parity_diff = float(abs(ppv_p - ppv_u))  if not (np.isnan(ppv_p) or np.isnan(ppv_u)) else float("nan")
-        result.fnr_parity_diff        = float(abs(fnr_p - fnr_u))  if not (np.isnan(fnr_p) or np.isnan(fnr_u)) else float("nan")
+        result.predictive_parity_diff = float(abs(ppv_p - ppv_u)) if not (np.isnan(ppv_p) or np.isnan(ppv_u)) else float("nan")
+        result.fnr_parity_diff        = float(abs(fnr_p - fnr_u)) if not (np.isnan(fnr_p) or np.isnan(fnr_u)) else float("nan")
 
-    # Determine pass/fail
     result.failures = _flag_failures(result)
     result.severity = _severity(result.failures)
     return result
@@ -215,3 +248,88 @@ def compute_metrics_for_all_attrs(
         attr: compute_all_metrics(df, config, y_pred=y_pred, attr=attr)
         for attr in config.protected_attrs
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V2: Bootstrap Confidence Intervals
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _bootstrap_single(
+    df: pd.DataFrame,
+    config: DatasetConfig,
+    y_pred: np.ndarray | None,
+    attr: str,
+    rng: np.random.Generator,
+) -> MetricsResult:
+    """Draw one bootstrap resample and return its MetricsResult."""
+    n = len(df)
+    idx = rng.integers(0, n, size=n)
+    df_boot = df.iloc[idx].reset_index(drop=True)
+    y_pred_boot = y_pred[idx] if y_pred is not None else None
+    return compute_all_metrics(df_boot, config, y_pred=y_pred_boot, attr=attr)
+
+
+def compute_bootstrap_ci(
+    df: pd.DataFrame,
+    config: DatasetConfig,
+    y_pred: np.ndarray | None = None,
+    attr: str | None = None,
+    n_bootstrap: int = 500,
+    ci_level: float = 0.95,
+    seed: int = 42,
+) -> MetricsResult:
+    """
+    Compute all 6 fairness metrics WITH bootstrap confidence intervals.
+
+    Runs n_bootstrap resamples and returns a MetricsResult where each
+    ci_* field is a ConfidenceInterval.  Point estimates are unchanged.
+
+    Parameters
+    ----------
+    n_bootstrap : number of bootstrap iterations (500 is standard for 95% CI)
+    ci_level    : confidence level, default 0.95
+
+    Returns
+    -------
+    MetricsResult with ci_* fields populated.
+    """
+    attr = attr or config.primary_protected_attr()
+    base = compute_all_metrics(df, config, y_pred=y_pred, attr=attr)
+
+    rng = np.random.default_rng(seed)
+    alpha = 1.0 - ci_level
+    lo_p  = (alpha / 2) * 100
+    hi_p  = (1 - alpha / 2) * 100
+
+    # Collect bootstrap samples
+    samples: dict[str, list[float]] = {
+        "di": [], "spd": [], "eod": [], "eopd": [], "pp": [], "fnr": [],
+    }
+
+    for _ in range(n_bootstrap):
+        m = _bootstrap_single(df, config, y_pred, attr, rng)
+        samples["di"].append(m.disparate_impact)
+        samples["spd"].append(m.statistical_parity_diff)
+        samples["eod"].append(m.equalized_odds_diff)
+        samples["eopd"].append(m.equal_opportunity_diff)
+        samples["pp"].append(m.predictive_parity_diff)
+        samples["fnr"].append(m.fnr_parity_diff)
+
+    def _ci(vals: list[float]) -> ConfidenceInterval | None:
+        clean = [v for v in vals if not np.isnan(v)]
+        if len(clean) < 10:
+            return None
+        return ConfidenceInterval(
+            lower=float(np.percentile(clean, lo_p)),
+            upper=float(np.percentile(clean, hi_p)),
+            level=ci_level,
+        )
+
+    base.ci_disparate_impact      = _ci(samples["di"])
+    base.ci_statistical_parity_diff = _ci(samples["spd"])
+    base.ci_equalized_odds_diff   = _ci(samples["eod"])
+    base.ci_equal_opportunity_diff = _ci(samples["eopd"])
+    base.ci_predictive_parity_diff = _ci(samples["pp"])
+    base.ci_fnr_parity_diff        = _ci(samples["fnr"])
+
+    return base

@@ -2,13 +2,21 @@
 ML Training — three model tracks:
   1. Baseline       : chosen base model, no mitigation
   2. Pre-processed  : chosen base model with AIF360 Reweighing sample weights
+                      (V2: uses train_preprocessed_presplit to avoid data leakage)
   3. In-processed   : Fairlearn ExponentiatedGradient (equalized odds)
 
+V2 additions:
+  - train_preprocessed_presplit(): accepts already-split train/test data so
+    reweighing weights fitted on train-only can be applied directly.
+  - Multiclass support: task_type="multiclass" trains without class_weight="balanced"
+    and uses stratified split on multi-valued target.
+  - Regression support: task_type="regression" uses sklearn regressors.
+
 Base models available:
-  "rf"    — RandomForestClassifier  (default, tree-based, handles non-linearity)
-  "lr"    — LogisticRegression      (linear, fast, interpretable)
-  "xgb"   — XGBoostClassifier       (gradient boosting, usually best accuracy)
-  "stack" — StackingClassifier      (LR + RF + XGB meta-learned by LR)
+  "rf"    — RandomForestClassifier / RandomForestRegressor
+  "lr"    — LogisticRegression / Ridge
+  "xgb"   — XGBoostClassifier / XGBoostRegressor
+  "stack" — StackingClassifier (LR + RF + XGB meta-learned by LR)
 """
 
 from __future__ import annotations
@@ -16,8 +24,8 @@ from dataclasses import dataclass, field
 from typing import Any
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, StackingClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, StackingClassifier
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.model_selection import train_test_split
 
 from src.utils.schema import DatasetConfig
@@ -31,21 +39,25 @@ MODEL_DISPLAY = {
 }
 
 
-def _build_rf() -> RandomForestClassifier:
+# ── Classification builders ───────────────────────────────────────────────────
+def _build_rf(multiclass: bool = False) -> RandomForestClassifier:
     return RandomForestClassifier(
         n_estimators=100, random_state=42,
-        class_weight="balanced", n_jobs=-1,
+        class_weight=None if multiclass else "balanced",
+        n_jobs=-1,
     )
 
 
-def _build_lr() -> LogisticRegression:
+def _build_lr(multiclass: bool = False) -> LogisticRegression:
     return LogisticRegression(
         max_iter=1000, random_state=42,
-        class_weight="balanced", solver="lbfgs",
+        class_weight=None if multiclass else "balanced",
+        solver="lbfgs",
+        multi_class="auto",
     )
 
 
-def _build_xgb() -> Any:
+def _build_xgb(multiclass: bool = False) -> Any:
     try:
         from xgboost import XGBClassifier
         return XGBClassifier(
@@ -54,16 +66,11 @@ def _build_xgb() -> Any:
             use_label_encoder=False,
         )
     except ImportError:
-        # Graceful fallback to sklearn GradientBoosting if XGBoost absent
         from sklearn.ensemble import GradientBoostingClassifier
         return GradientBoostingClassifier(n_estimators=100, random_state=42)
 
 
 def _build_stacking() -> StackingClassifier:
-    """
-    Three-model stack: LR + RF + XGB base learners, LR meta-learner.
-    Uses 3-fold cross-validation for out-of-fold predictions.
-    """
     estimators = [
         ("lr",  _build_lr()),
         ("rf",  RandomForestClassifier(n_estimators=50, random_state=42,
@@ -80,37 +87,59 @@ def _build_stacking() -> StackingClassifier:
         estimators.append(("gbm", GradientBoostingClassifier(
             n_estimators=50, random_state=42,
         )))
-
     return StackingClassifier(
         estimators=estimators,
         final_estimator=LogisticRegression(max_iter=500, random_state=42),
-        cv=3,
-        passthrough=False,
-        n_jobs=-1,
+        cv=3, passthrough=False, n_jobs=-1,
     )
 
 
-# Registry — callable so each call gets a fresh, unfitted instance
+# ── Regression builders ───────────────────────────────────────────────────────
+def _build_rf_reg() -> RandomForestRegressor:
+    return RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+
+
+def _build_lr_reg() -> Ridge:
+    return Ridge(alpha=1.0)
+
+
+def _build_xgb_reg() -> Any:
+    try:
+        from xgboost import XGBRegressor
+        return XGBRegressor(n_estimators=100, random_state=42, verbosity=0)
+    except ImportError:
+        from sklearn.ensemble import GradientBoostingRegressor
+        return GradientBoostingRegressor(n_estimators=100, random_state=42)
+
+
+# Registries
 MODEL_REGISTRY: dict[str, Any] = {
     "rf":    _build_rf,
     "lr":    _build_lr,
     "xgb":   _build_xgb,
     "stack": _build_stacking,
 }
+MODEL_REGISTRY_REG: dict[str, Any] = {
+    "rf":  _build_rf_reg,
+    "lr":  _build_lr_reg,
+    "xgb": _build_xgb_reg,
+    "stack": _build_rf_reg,  # no stacking for regression; fallback to RF
+}
 
 
 @dataclass
 class TrainResult:
     model: Any
-    model_type: str          # "baseline_rf" | "baseline_lr" | etc.
-    base_model: str          # "rf" | "lr" | "xgb" | "stack"
+    model_type: str
+    base_model: str
     X_train: pd.DataFrame
     X_test: pd.DataFrame
     y_train: pd.Series
     y_test: pd.Series
     y_pred: np.ndarray
-    S_test: pd.Series        # protected attribute for fairness eval
+    S_test: pd.Series
     feature_names: list[str] = field(default_factory=list)
+    task_type: str = "binary"
 
 
 def _get_s_test(X_te: pd.DataFrame, config: DatasetConfig) -> pd.Series:
@@ -123,6 +152,11 @@ def _get_s_test(X_te: pd.DataFrame, config: DatasetConfig) -> pd.Series:
     return pd.Series(dtype=float)
 
 
+def _stratify_arg(y: pd.Series, task_type: str):
+    """Return stratify argument: y for binary/multiclass, None for regression."""
+    return y if task_type != "regression" else None
+
+
 def train_baseline(
     X: pd.DataFrame,
     y: pd.Series,
@@ -132,13 +166,32 @@ def train_baseline(
     random_state: int = 42,
 ) -> TrainResult:
     """Train the chosen base model with no fairness mitigation."""
+    task = config.task_type if hasattr(config, "task_type") else "binary"
+
+    if task == "regression":
+        registry = MODEL_REGISTRY_REG
+    else:
+        registry = MODEL_REGISTRY
+        # Pass multiclass flag to avoid class_weight="balanced" for multiclass
+        _mc = (task == "multiclass")
+
     if base_model not in MODEL_REGISTRY:
         raise ValueError(f"Unknown base_model '{base_model}'. Choose from: {list(MODEL_REGISTRY)}")
 
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y,
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=_stratify_arg(y, task),
     )
-    clf = MODEL_REGISTRY[base_model]()
+
+    if task == "regression":
+        clf = MODEL_REGISTRY_REG[base_model]()
+    elif task == "multiclass":
+        clf = MODEL_REGISTRY[base_model](multiclass=True) if base_model in ("rf", "lr") else MODEL_REGISTRY[base_model]()
+    else:
+        clf = MODEL_REGISTRY[base_model]()
+
     clf.fit(X_tr, y_tr)
     y_pred = clf.predict(X_te)
 
@@ -151,6 +204,7 @@ def train_baseline(
         y_pred=y_pred,
         S_test=_get_s_test(X_te, config),
         feature_names=list(X.columns),
+        task_type=task,
     )
 
 
@@ -163,25 +217,32 @@ def train_preprocessed(
     test_size: float = 0.2,
     random_state: int = 42,
 ) -> TrainResult:
-    """Train with AIF360 Reweighing sample weights applied to the base model."""
+    """
+    Train with AIF360 Reweighing sample weights.
+
+    NOTE: This legacy function re-splits the full dataset. Prefer
+    train_preprocessed_presplit() when you have already split the data and
+    want to avoid data leakage from fitting the reweigher on test rows.
+    """
+    task = config.task_type if hasattr(config, "task_type") else "binary"
+
     if base_model not in MODEL_REGISTRY:
-        raise ValueError(f"Unknown base_model '{base_model}'. Choose from: {list(MODEL_REGISTRY)}")
+        raise ValueError(f"Unknown base_model '{base_model}'.")
 
     X_tr, X_te, y_tr, y_te, w_tr, _ = train_test_split(
-        X, y, weights, test_size=test_size, random_state=random_state, stratify=y,
+        X, y, weights,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=_stratify_arg(y, task),
     )
-    clf = MODEL_REGISTRY[base_model]()
 
-    # StackingClassifier in sklearn ≥1.4 propagates sample_weight to base
-    # estimators that support it.  Wrap in try/except for any edge-case.
+    clf = MODEL_REGISTRY[base_model]() if task != "regression" else MODEL_REGISTRY_REG[base_model]()
     try:
         clf.fit(X_tr, y_tr, sample_weight=w_tr)
     except TypeError:
-        # Fallback: fit without weights (stacking meta-learner may not support it)
         clf.fit(X_tr, y_tr)
 
     y_pred = clf.predict(X_te)
-
     return TrainResult(
         model=clf,
         model_type=f"preprocessed_{base_model}",
@@ -191,6 +252,52 @@ def train_preprocessed(
         y_pred=y_pred,
         S_test=_get_s_test(X_te, config),
         feature_names=list(X.columns),
+        task_type=task,
+    )
+
+
+def train_preprocessed_presplit(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    weights_train: np.ndarray,
+    config: DatasetConfig,
+    base_model: str = "rf",
+) -> TrainResult:
+    """
+    V2: Train with reweighing weights fitted on TRAINING data only.
+
+    Uses the pre-existing train/test split from the baseline model so that
+    the reweigher is never exposed to test-set rows.  This eliminates the
+    data leakage present in the legacy train_preprocessed().
+
+    Parameters
+    ----------
+    weights_train : sample weights for X_train rows only (shape = n_train).
+    """
+    task = config.task_type if hasattr(config, "task_type") else "binary"
+
+    if base_model not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown base_model '{base_model}'.")
+
+    clf = MODEL_REGISTRY[base_model]() if task != "regression" else MODEL_REGISTRY_REG[base_model]()
+    try:
+        clf.fit(X_train, y_train, sample_weight=weights_train)
+    except TypeError:
+        clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+    return TrainResult(
+        model=clf,
+        model_type=f"preprocessed_{base_model}",
+        base_model=base_model,
+        X_train=X_train, X_test=X_test,
+        y_train=y_train, y_test=y_test,
+        y_pred=y_pred,
+        S_test=_get_s_test(X_test, config),
+        feature_names=list(X_train.columns),
+        task_type=task,
     )
 
 
@@ -205,16 +312,13 @@ def train_inprocessed(
     random_state: int = 42,
 ) -> TrainResult:
     """
-    Fairlearn in-processing.  Protected attrs are kept out of X but passed
-    as sensitive_features to the fairness estimator.
-
-    base_model selects the underlying estimator wrapped by ExponentiatedGradient
-    or GridSearch.  'stack' is not supported here (Fairlearn requires a simple
-    sklearn estimator); falls back to 'rf'.
+    Fairlearn in-processing (binary classification only).
+    'stack' falls back to 'rf' as Fairlearn requires a simple estimator.
     """
     from src.bias_engine.inprocessor import train_expgrad_model, train_gridsearch_model
+    task = config.task_type if hasattr(config, "task_type") else "binary"
 
-    eff_base = "rf" if base_model == "stack" else base_model
+    eff_base  = "rf" if base_model == "stack" else base_model
     estimator = MODEL_REGISTRY[eff_base]()
 
     attr = config.primary_protected_attr()
@@ -222,7 +326,10 @@ def train_inprocessed(
                  if c in config.protected_attrs or c.endswith("_binary")]
 
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y,
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=_stratify_arg(y, task),
     )
     S_tr = (X_tr[attr] if attr in X_tr.columns
             else X_tr.get(f"{attr}_binary", pd.Series(dtype=float)))
@@ -233,15 +340,12 @@ def train_inprocessed(
 
     if method == "expgrad":
         result = train_expgrad_model(X_tr_f, y_tr, S_tr,
-                                     constraint=constraint,
-                                     estimator=estimator)
+                                     constraint=constraint, estimator=estimator)
     else:
         result = train_gridsearch_model(X_tr_f, y_tr, S_tr,
-                                        constraint=constraint,
-                                        estimator=estimator)
+                                        constraint=constraint, estimator=estimator)
 
     y_pred = result.model.predict(X_te_f)
-
     return TrainResult(
         model=result.model,
         model_type=f"inprocessed_{eff_base}",
@@ -251,4 +355,5 @@ def train_inprocessed(
         y_pred=y_pred,
         S_test=S_te,
         feature_names=list(X_tr_f.columns),
+        task_type=task,
     )

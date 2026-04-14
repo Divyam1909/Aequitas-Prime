@@ -2,7 +2,13 @@
 Shadow Proxy Scanner — detects features that are statistical proxies for
 protected attributes even after the protected attribute itself is removed.
 
-Uses three complementary measures:
+V2 changes:
+  - combined_score: weighted fusion of MI + Cramér's V + Point-Biserial
+  - Risk level now driven by combined_score (not MI alone)
+  - ProxyResult.combined_score field added
+  - Weights: MI=0.50, Cramér's V=0.30, Point-Biserial=0.20
+
+Three complementary measures:
   - Mutual Information (works for any feature type)
   - Cramér's V (for categorical vs categorical)
   - Point-Biserial correlation (for continuous vs binary protected attr)
@@ -24,15 +30,28 @@ class ProxyResult:
     mutual_info: float
     cramers_v: float | None
     point_biserial_r: float | None
-    risk_level: str       # "HIGH" / "MEDIUM" / "LOW" / "NEGLIGIBLE"
-    action: str
+    # V2: fused score and risk driven by it
+    combined_score: float = 0.0
+    risk_level: str = "NEGLIGIBLE"   # "HIGH" / "MEDIUM" / "LOW" / "NEGLIGIBLE"
+    action: str = ""
 
 
+# ── Risk thresholds on combined_score (0–1 scale) ───────────────────────────
 RISK_THRESHOLDS = {
     "HIGH":       0.15,
     "MEDIUM":     0.08,
     "LOW":        0.03,
 }
+
+# Fusion weights (must sum to 1.0)
+_W_MI  = 0.50
+_W_CV  = 0.30
+_W_PBR = 0.20
+
+# Typical maximum values used for normalisation
+_MAX_MI  = 1.0   # MI is unbounded but rarely > 1 on tabular data
+_MAX_CV  = 1.0   # Cramér's V is already in [0, 1]
+_MAX_PBR = 1.0   # |point-biserial r| is in [0, 1]
 
 ACTIONS = {
     "HIGH":       "Consider removing or capping — strong statistical proxy for the protected attribute.",
@@ -58,6 +77,41 @@ def _cramers_v(x: pd.Series, y: pd.Series) -> float:
     return float(np.sqrt(phi2_corr / denom))
 
 
+def _fused_score(mi: float, cv: float | None, pbr: float | None) -> float:
+    """
+    Compute a weighted combination of all three association measures.
+
+    Any missing signal gets its weight redistributed proportionally to the
+    available signals so the result always stays in [0, 1].
+    """
+    available = {"mi": mi / _MAX_MI}
+    weights   = {"mi": _W_MI}
+
+    if cv is not None:
+        available["cv"]  = cv / _MAX_CV
+        weights["cv"]    = _W_CV
+    if pbr is not None:
+        available["pbr"] = pbr / _MAX_PBR
+        weights["pbr"]   = _W_PBR
+
+    total_w = sum(weights.values())
+    if total_w == 0:
+        return 0.0
+
+    score = sum(available[k] * weights[k] for k in available) / total_w
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _risk_from_score(score: float) -> str:
+    if score >= RISK_THRESHOLDS["HIGH"]:
+        return "HIGH"
+    if score >= RISK_THRESHOLDS["MEDIUM"]:
+        return "MEDIUM"
+    if score >= RISK_THRESHOLDS["LOW"]:
+        return "LOW"
+    return "NEGLIGIBLE"
+
+
 def scan_proxies(
     df: pd.DataFrame,
     config: DatasetConfig,
@@ -66,17 +120,12 @@ def scan_proxies(
     """
     Scan all non-protected, non-target features for proxy risk.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The clean (encoded) DataFrame. Protected attrs must be present as columns.
-    config : DatasetConfig
-    exclude_cols : list[str], optional
-        Additional columns to skip (e.g. sample_weight).
+    V2: risk level is now determined by combined_score (weighted fusion of
+    MI, Cramér's V, and Point-Biserial) rather than MI alone.
 
     Returns
     -------
-    dict mapping protected_attr → sorted list of ProxyResult (highest MI first)
+    dict mapping protected_attr → sorted list of ProxyResult (highest combined_score first)
     """
     exclude = set(config.protected_attrs) | {config.target_col} | set(exclude_cols or [])
     feature_cols = [c for c in df.columns if c not in exclude]
@@ -84,27 +133,23 @@ def scan_proxies(
     results: dict[str, list[ProxyResult]] = {}
 
     for attr in config.protected_attrs:
-        # Support renamed columns (e.g. "race" → "race_binary" after encoding)
         resolved_attr = attr if attr in df.columns else f"{attr}_binary"
         if resolved_attr not in df.columns:
             continue
-        attr_col_name = resolved_attr  # actual column in df
+        attr_col_name = resolved_attr
 
         protected_series = df[attr_col_name]
-        # Exclude the resolved column name too
         feat_cols_for_attr = [c for c in feature_cols if c != attr_col_name]
-        # For MI: needs a clean array with no NaN
+
         valid_mask = protected_series.notna()
         X_clean = df.loc[valid_mask, feat_cols_for_attr].fillna(0)
         y_clean = protected_series[valid_mask]
 
-        # Encode protected attr to numeric for MI if needed
         if y_clean.dtype == object:
             y_num = pd.Categorical(y_clean).codes
         else:
             y_num = y_clean.values.astype(int)
 
-        # Mutual information (discrete_features=False → treats all as continuous)
         mi_scores = mutual_info_classif(
             X_clean.values, y_num, random_state=42, n_neighbors=3
         )
@@ -113,46 +158,44 @@ def scan_proxies(
         for i, feat in enumerate(feat_cols_for_attr):
             mi = float(mi_scores[i])
 
-            # Cramér's V (only meaningful for categorical features — low cardinality)
             feat_series = df[feat].dropna()
             n_unique = feat_series.nunique()
             cv = None
+            pbr = None
+
+            # Cramér's V for low-cardinality features
             if n_unique <= 20:
                 aligned = df[[feat, attr_col_name]].dropna()
                 if len(aligned) > 10:
-                    cv = _cramers_v(aligned[feat].astype(str), aligned[attr_col_name].astype(str))
+                    cv = _cramers_v(
+                        aligned[feat].astype(str),
+                        aligned[attr_col_name].astype(str),
+                    )
 
-            # Point-Biserial (only for continuous feature vs binary protected)
-            pb_r = None
+            # Point-Biserial for continuous features vs binary protected attr
             if n_unique > 20 and len(y_num) > 10:
                 try:
-                    result = stats.pointbiserialr(y_num, X_clean[feat].values)
-                    pb_r = float(abs(result.statistic))
+                    res = stats.pointbiserialr(y_num, X_clean[feat].values)
+                    pbr = float(abs(res.statistic))
                 except Exception:
                     pass
 
-            # Risk level driven by MI score
-            if mi >= RISK_THRESHOLDS["HIGH"]:
-                risk = "HIGH"
-            elif mi >= RISK_THRESHOLDS["MEDIUM"]:
-                risk = "MEDIUM"
-            elif mi >= RISK_THRESHOLDS["LOW"]:
-                risk = "LOW"
-            else:
-                risk = "NEGLIGIBLE"
+            combined = _fused_score(mi, cv, pbr)
+            risk = _risk_from_score(combined)
 
             attr_results.append(ProxyResult(
                 feature=feat,
                 protected_attr=attr,
                 mutual_info=mi,
                 cramers_v=cv,
-                point_biserial_r=pb_r,
+                point_biserial_r=pbr,
+                combined_score=combined,
                 risk_level=risk,
                 action=ACTIONS[risk],
             ))
 
-        # Sort by MI descending
-        attr_results.sort(key=lambda r: r.mutual_info, reverse=True)
+        # Sort by combined_score descending (V2: was MI-only)
+        attr_results.sort(key=lambda r: r.combined_score, reverse=True)
         results[attr] = attr_results
 
     return results
@@ -163,19 +206,19 @@ def get_flagged_proxies(scan_results: dict[str, list[ProxyResult]]) -> list[Prox
     flagged = []
     for results in scan_results.values():
         flagged.extend([r for r in results if r.risk_level in ("HIGH", "MEDIUM")])
-    flagged.sort(key=lambda r: r.mutual_info, reverse=True)
+    flagged.sort(key=lambda r: r.combined_score, reverse=True)
     return flagged
 
 
 def proxy_heatmap_data(scan_results: dict[str, list[ProxyResult]]) -> pd.DataFrame:
     """
     Build a DataFrame suitable for a Plotly heatmap.
-    Rows = features, Columns = protected attributes, Values = mutual information score.
+    Rows = features, Columns = protected attributes, Values = combined_score (V2).
     """
     rows = {}
     for attr, results in scan_results.items():
         for r in results:
             if r.feature not in rows:
                 rows[r.feature] = {}
-            rows[r.feature][attr] = r.mutual_info
+            rows[r.feature][attr] = r.combined_score   # V2: was mutual_info
     return pd.DataFrame(rows).T.fillna(0)
