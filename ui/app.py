@@ -293,7 +293,37 @@ def build_config_ui(df: pd.DataFrame, is_demo: bool = False):
     # ── Positive outcome value ─────────────────────────────────────────────────
     if target_col in df.columns:
         target_vals = sorted(df[target_col].dropna().astype(str).unique().tolist())
-        default_pos = ">50K" if (is_demo and ">50K" in target_vals) else target_vals[0]
+
+        def _pick_default_positive(vals: list[str]) -> str:
+            # 1. Prefer values starting with ">" (income thresholds: >50K, >100K)
+            for v in vals:
+                if str(v).startswith(">"):
+                    return v
+            # 2. Prefer clearly positive/favourable labels
+            positive_hints = {
+                "yes", "1", "true", "approved", "high", "positive",
+                "good", "hired", "accept", "accepted", "pass", "passed",
+                "grant", "granted", "non-default", "non_default",
+                "no churn", "no_churn", "retain", "retained",
+            }
+            for v in vals:
+                if str(v).lower() in positive_hints:
+                    return v
+            # 3. Prefer values containing "not" or "non" (non-fraud, not-default)
+            for v in vals:
+                vl = str(v).lower()
+                if vl.startswith("not") or vl.startswith("non"):
+                    return v
+            # 4. For two-value columns, prefer the minority class (often the positive/event class)
+            if len(vals) == 2:
+                raw_counts = df[target_col].astype(str).value_counts()
+                minority = raw_counts.idxmin()
+                if minority in vals:
+                    return minority
+            # 5. Fallback: last alphabetically
+            return vals[-1]
+
+        default_pos = _pick_default_positive(target_vals)
         default_pos_idx = target_vals.index(default_pos) if default_pos in target_vals else 0
         positive_label = st.selectbox(
             "Positive Outcome Value", options=target_vals, index=default_pos_idx, key="cfg_pos",
@@ -340,6 +370,15 @@ def build_config_ui(df: pd.DataFrame, is_demo: bool = False):
         st.warning("Select at least one protected attribute to continue.")
         return None
 
+    # Warn about high-cardinality numeric attrs that may produce unreliable metrics
+    for attr in selected_attrs:
+        if df[attr].dtype != object and df[attr].nunique() > 20:
+            st.warning(
+                f"⚠️ **{attr}** is a continuous numeric column with {df[attr].nunique()} unique values. "
+                "Fairness metrics compare one specific privileged value against all others — "
+                "for continuous attributes like age consider binning the column first (e.g. age < 40 vs ≥ 40)."
+            )
+
     # ── Privileged values ──────────────────────────────────────────────────────
     st.markdown("**Privileged Group Values** — the historically dominant group in each attribute")
     hint(
@@ -347,14 +386,20 @@ def build_config_ui(df: pd.DataFrame, is_demo: bool = False):
         "(e.g. Male, White, Non-Disabled). Fairness metrics are computed relative to this group. "
         "This does <b>not</b> imply moral judgement — it's a statistical reference point."
     )
-    adult_defaults = {"sex": "Male", "race": "White"}
+    # Well-known privileged group defaults — applied for any dataset, not just demo
+    KNOWN_PRIVILEGED = {"sex": "Male", "race": "White", "gender": "Male"}
     privileged_values = {}
     pv_cols = st.columns(min(len(selected_attrs), 3))
     for i, attr in enumerate(selected_attrs):
         with pv_cols[i % len(pv_cols)]:
             attr_vals = sorted(df[attr].dropna().astype(str).unique().tolist())
-            default_priv = adult_defaults.get(attr, attr_vals[0]) if is_demo else attr_vals[0]
-            default_priv_idx = attr_vals.index(default_priv) if default_priv in attr_vals else 0
+            # Use known default if available, else fall back to last alphabetically
+            # (minority/disadvantaged groups often sort last, so last = privileged is wrong;
+            # but without domain knowledge we just keep it explicit for the user)
+            default_priv = KNOWN_PRIVILEGED.get(attr, attr_vals[0])
+            if default_priv not in attr_vals:
+                default_priv = attr_vals[0]
+            default_priv_idx = attr_vals.index(default_priv)
             priv_val = st.selectbox(
                 f"Privileged: **{attr}**", options=attr_vals,
                 index=default_priv_idx, key=f"cfg_priv_{attr}",
@@ -628,7 +673,20 @@ with tab1:
         st.stop()
 
     result  = st.session_state["pipeline_result"]
-    primary = result.config.primary_protected_attr()
+
+    # Pick the most-biased protected attr as "primary" for the 6-metric table and
+    # provenance — prefer the attr with the lowest valid DI (most legally concerning).
+    def _primary_by_bias(res) -> str:
+        if res.baseline_eval is None:
+            return res.config.primary_protected_attr()
+        def _di_key(attr):
+            m = res.baseline_eval.fairness.get(attr)
+            if m is None or np.isnan(m.disparate_impact) or m.privileged_count == 0:
+                return 2.0  # sort last — undefined/empty-group metrics
+            return m.disparate_impact  # lower DI = more biased = show first
+        return min(res.config.protected_attrs, key=_di_key)
+
+    primary = _primary_by_bias(result)
     bm      = result.baseline_eval.fairness.get(primary) if result.baseline_eval else None
 
     st.divider()
@@ -640,45 +698,62 @@ with tab1:
         "A DI below <b>0.80</b> violates the US 4/5ths rule (EEOC) and the EU AI Act Article 10. "
         "<b>Green ≥ 0.90</b> = compliant. <b>Yellow 0.80–0.90</b> = borderline. <b>Red &lt; 0.80</b> = legally actionable."
     )
-    gauge_cols = st.columns(len(result.config.protected_attrs))
-    for i, attr in enumerate(result.config.protected_attrs):
-        m = result.baseline_eval.fairness.get(attr) if result.baseline_eval else None
-        if m:
-            with gauge_cols[i]:
-                di_val = m.disparate_impact if not np.isnan(m.disparate_impact) else 0.0
-                st.plotly_chart(di_gauge(di_val, f"DI — {attr}"),
-                                use_container_width=True, config={"displayModeBar": False})
-                priv_rate   = m.privileged_approval_rate
-                unpriv_rate = m.unprivileged_approval_rate
-                ratio_pct   = f"{di_val:.1%}"
-                if di_val < 0.80:
-                    st.markdown(f"""
-                    <div class="alert-box-critical">
-                      <div class="alert-title">🚨 BIAS DETECTED — {attr.upper()}</div>
-                      <b>DI = {di_val:.3f}</b> (legal minimum: 0.80)<br>
-                      Unprivileged group receives positive outcomes at only <b>{ratio_pct}</b> the rate of the privileged group.<br>
-                      <span style="opacity:0.8;font-size:0.82rem">
-                        Privileged: {priv_rate:.1%} &nbsp;|&nbsp; Unprivileged: {unpriv_rate:.1%}
-                      </span><br><br>
-                      <b>Next step:</b> Go to the <b>⚗️ Surgeon</b> tab to apply bias mitigation.
-                    </div>
-                    """, unsafe_allow_html=True)
-                elif di_val < 0.90:
-                    st.markdown(f"""
-                    <div class="alert-box-warn">
-                      <b>⚠️ {attr.upper()}: DI = {di_val:.3f} — Borderline</b><br>
-                      Passes the 0.80 legal threshold but regulators often scrutinise DI below 0.90.
-                      Approval gap: {priv_rate:.1%} (privileged) vs {unpriv_rate:.1%} (unprivileged). <b>Monitoring recommended.</b>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.markdown(f"""
-                    <div class="alert-box-ok">
-                      <b>✅ {attr.upper()}: DI = {di_val:.3f} — Compliant</b><br>
-                      Above the 0.80 threshold. Approval rates are similar:
-                      {priv_rate:.1%} (privileged) vs {unpriv_rate:.1%} (unprivileged). No immediate action needed.
-                    </div>
-                    """, unsafe_allow_html=True)
+    _GAUGE_COLS = 3  # max gauges per row
+    _all_attrs = result.config.protected_attrs
+    for _row_start in range(0, len(_all_attrs), _GAUGE_COLS):
+        _row_attrs = _all_attrs[_row_start:_row_start + _GAUGE_COLS]
+        gauge_cols = st.columns(len(_row_attrs))
+        for i, attr in enumerate(_row_attrs):
+            m = result.baseline_eval.fairness.get(attr) if result.baseline_eval else None
+            if m:
+                with gauge_cols[i]:
+                    _di_raw = m.disparate_impact
+                    _di_nan = isinstance(_di_raw, float) and np.isnan(_di_raw)
+                    di_val  = 0.0 if _di_nan else _di_raw
+                    st.plotly_chart(di_gauge(di_val, f"DI — {attr}"),
+                                    use_container_width=True, config={"displayModeBar": False})
+                    priv_rate   = m.privileged_approval_rate
+                    unpriv_rate = m.unprivileged_approval_rate
+                    _priv_nan   = isinstance(priv_rate, float) and np.isnan(priv_rate)
+
+                    if _di_nan or _priv_nan or m.privileged_count == 0:
+                        # Privileged group was empty — config may have a bad privileged value
+                        st.markdown(f"""
+                        <div class="alert-box-warn">
+                          <b>⚠️ {attr.upper()}: DI = N/A — Privileged group not found</b><br>
+                          No rows matched the privileged value <code>{m.privileged_value}</code> for column <b>{attr}</b>.
+                          Check the <b>Privileged Group Value</b> setting in the config above and re-run.
+                        </div>
+                        """, unsafe_allow_html=True)
+                    elif di_val < 0.80:
+                        ratio_pct = f"{di_val:.1%}"
+                        st.markdown(f"""
+                        <div class="alert-box-critical">
+                          <div class="alert-title">🚨 BIAS DETECTED — {attr.upper()}</div>
+                          <b>DI = {di_val:.3f}</b> (legal minimum: 0.80)<br>
+                          Unprivileged group receives positive outcomes at only <b>{ratio_pct}</b> the rate of the privileged group.<br>
+                          <span style="opacity:0.8;font-size:0.82rem">
+                            Privileged: {priv_rate:.1%} &nbsp;|&nbsp; Unprivileged: {unpriv_rate:.1%}
+                          </span><br><br>
+                          <b>Next step:</b> Go to the <b>⚗️ Surgeon</b> tab to apply bias mitigation.
+                        </div>
+                        """, unsafe_allow_html=True)
+                    elif di_val < 0.90:
+                        st.markdown(f"""
+                        <div class="alert-box-warn">
+                          <b>⚠️ {attr.upper()}: DI = {di_val:.3f} — Borderline</b><br>
+                          Passes the 0.80 legal threshold but regulators often scrutinise DI below 0.90.
+                          Approval gap: {priv_rate:.1%} (privileged) vs {unpriv_rate:.1%} (unprivileged). <b>Monitoring recommended.</b>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="alert-box-ok">
+                          <b>✅ {attr.upper()}: DI = {di_val:.3f} — Compliant</b><br>
+                          Above the 0.80 threshold. Approval rates are similar:
+                          {priv_rate:.1%} (privileged) vs {unpriv_rate:.1%} (unprivileged). No immediate action needed.
+                        </div>
+                        """, unsafe_allow_html=True)
 
     st.divider()
 
@@ -689,8 +764,25 @@ with tab1:
         "A model can pass Disparate Impact but still fail Equalized Odds — that's why all six matter. "
         "<b>Hover the 'Plain-English Meaning' column for a non-technical explanation of each metric.</b>"
     )
-    if bm:
-        show_six_metric_table(bm, primary)
+
+    # Let the user pick any protected attribute — defaults to the most biased one
+    _attr_options = result.config.protected_attrs
+    _default_idx  = _attr_options.index(primary) if primary in _attr_options else 0
+    selected_metric_attr = st.selectbox(
+        "Show 6-metric breakdown for:",
+        options=_attr_options,
+        index=_default_idx,
+        key="six_metric_attr_selector",
+        help=(
+            "The most biased attribute is pre-selected. "
+            "Switch to inspect the full metric breakdown for any other protected attribute."
+        ),
+    )
+    _bm_selected = result.baseline_eval.fairness.get(selected_metric_attr) if result.baseline_eval else None
+    if _bm_selected:
+        show_six_metric_table(_bm_selected, selected_metric_attr)
+    else:
+        st.info(f"No metrics available for **{selected_metric_attr}**.")
 
     st.divider()
 
@@ -740,7 +832,8 @@ with tab1:
         "<b>Feature Bias</b> — features encode demographics as proxies (fix: remove or repair those features)."
     )
     from src.bias_engine.provenance import trace_bias_provenance
-    prov = trace_bias_provenance(result._df_clean, result.config, result.proxy_scan)
+    prov = trace_bias_provenance(result._df_clean, result.config, result.proxy_scan,
+                                 primary_attr=primary)
     st.session_state["provenance"] = prov
     p1, p2, p3 = st.columns(3)
     p1.metric("Primary Bias Source",  prov.primary_label,
@@ -1250,12 +1343,60 @@ with tab4:
         st.stop()
 
     result = st.session_state["pipeline_result"]
-    from src.bias_engine.intersectional import compute_intersectional_metrics, get_heatmap_data
+    from src.bias_engine.intersectional import (
+        compute_intersectional_metrics, get_heatmap_data, _pick_intersectional_attrs
+    )
 
-    with st.spinner("Computing intersectional metrics..."):
-        df_test = result._df_clean.loc[result.baseline_train.X_test.index]
-        y_pred  = result.baseline_train.y_pred
-        inter   = compute_intersectional_metrics(df_test, result.config, y_pred=y_pred)
+    df_test = result._df_clean.loc[result.baseline_train.X_test.index]
+    y_pred  = result.baseline_train.y_pred
+
+    # ── Attribute selector ─────────────────────────────────────────────────────
+    # Auto-pick safe attrs (prevents combinatorial explosion), let user override
+    _auto_attrs = _pick_intersectional_attrs(df_test, result.config)
+    _all_eligible = [
+        a for a in result.config.protected_attrs
+        if a in df_test.columns and df_test[a].nunique() >= 2
+    ]
+    hint(
+        "Intersectional analysis cross-tabulates every combination of the selected attributes. "
+        "To prevent slowdowns, attributes with >10 unique values are excluded by default. "
+        "<b>Select 2–3 attributes</b> for best results."
+    )
+    selected_inter_attrs = st.multiselect(
+        "Attributes to cross-tabulate:",
+        options=_all_eligible,
+        default=_auto_attrs,
+        key="inter_attrs_selector",
+        help="Auto-selected: the most biased low-cardinality attributes. Adding high-cardinality columns will slow computation significantly.",
+    )
+    if not selected_inter_attrs:
+        st.warning("Select at least one attribute above.")
+        st.stop()
+
+    # Warn if the combination count will be large
+    _combo_count = 1
+    for _a in selected_inter_attrs:
+        _combo_count *= df_test[_a].nunique()
+    if _combo_count > 10_000:
+        st.error(
+            f"⚠️ {_combo_count:,} combinations — this will be very slow. "
+            "Please reduce the number of selected attributes or choose lower-cardinality ones."
+        )
+        st.stop()
+    elif _combo_count > 1_000:
+        st.warning(f"{_combo_count:,} combinations to check — may take a few seconds.")
+
+    # Cache key: pipeline run + selected attrs
+    _cache_key = f"inter_{id(result)}_{'_'.join(sorted(selected_inter_attrs))}"
+    if st.session_state.get("_inter_cache_key") != _cache_key:
+        with st.spinner(f"Computing intersectional metrics across {_combo_count:,} combinations..."):
+            inter = compute_intersectional_metrics(
+                df_test, result.config, y_pred=y_pred, attrs=selected_inter_attrs
+            )
+        st.session_state["inter_results"]    = inter
+        st.session_state["_inter_cache_key"] = _cache_key
+    else:
+        inter = st.session_state["inter_results"]
 
     if not inter:
         st.warning("Not enough data for intersectional analysis (need ≥30 samples per intersectional group).")

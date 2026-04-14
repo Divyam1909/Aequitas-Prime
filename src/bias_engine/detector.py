@@ -54,11 +54,27 @@ class MetricsResult:
     severity: str = "UNKNOWN"   # CLEAR / WARNING / CRITICAL
 
 
+def _coerce_priv_val(col: pd.Series, priv_val: object) -> object:
+    """
+    Cast priv_val to match the dtype of col so that equality comparisons work
+    even when the UI always stores values as strings but the column is numeric.
+    E.g. col dtype=int64, priv_val="23" → returns 23 (int).
+    """
+    if not pd.api.types.is_object_dtype(col) and not pd.api.types.is_string_dtype(col):
+        try:
+            return col.dtype.type(priv_val)
+        except (ValueError, TypeError):
+            pass
+    return priv_val
+
+
 def _split_groups(
     df: pd.DataFrame, attr: str, priv_val: object, target_col: str
 ) -> tuple[pd.Series, pd.Series]:
     """Return (privileged_target_series, unprivileged_target_series)."""
-    priv_mask = df[attr] == priv_val
+    col = df[attr]
+    priv_val = _coerce_priv_val(col, priv_val)
+    priv_mask = col == priv_val
     return df.loc[priv_mask, target_col], df.loc[~priv_mask, target_col]
 
 
@@ -121,7 +137,7 @@ def compute_all_metrics(
         Which protected attribute to analyse. Defaults to the primary one.
     """
     attr = attr or config.primary_protected_attr()
-    priv_val = config.privileged_values[attr]
+    priv_val = _coerce_priv_val(df[attr], config.privileged_values[attr])
     priv_mask = df[attr] == priv_val
 
     priv_y   = df.loc[priv_mask,  config.target_col]

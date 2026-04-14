@@ -16,6 +16,7 @@ from aif360.datasets import BinaryLabelDataset
 from aif360.algorithms.preprocessing import Reweighing, DisparateImpactRemover
 
 from src.utils.schema import DatasetConfig
+from src.bias_engine.detector import _coerce_priv_val
 
 
 @dataclass
@@ -41,15 +42,23 @@ class BeforeAfterResult:
 
 def _to_bld(df: pd.DataFrame, config: DatasetConfig, attr: str) -> BinaryLabelDataset:
     """Convert a DataFrame to AIF360 BinaryLabelDataset for one protected attribute."""
-    # AIF360 needs numeric protected attribute
+    # AIF360 needs numeric protected attribute encoded as 1=privileged, 0=unprivileged
     df_aif = df[[attr, config.target_col]].copy()
-    # Ensure binary 0/1 encoding for both columns
-    if df_aif[attr].dtype == object:
-        df_aif[attr] = (df_aif[attr] == config.privileged_values[attr]).astype(float)
+    priv_val_raw = config.privileged_values[attr]
+    col = df_aif[attr]
+    if col.dtype == object or pd.api.types.is_string_dtype(col):
+        # String column: compare directly
+        df_aif[attr] = (col == priv_val_raw).astype(float)
+    else:
+        # Numeric column: coerce priv_val to the column's dtype before comparing
+        try:
+            priv_val_typed = col.dtype.type(priv_val_raw)
+        except (ValueError, TypeError):
+            priv_val_typed = priv_val_raw
+        df_aif[attr] = (col == priv_val_typed).astype(float)
     df_aif[config.target_col] = df_aif[config.target_col].astype(float)
 
-    priv_val = config.privileged_values[attr]
-    numeric_priv = 1.0 if df_aif[attr].dtype != object else float(priv_val == config.privileged_values[attr])
+    numeric_priv = 1.0  # always 1.0 after the encoding above
 
     return BinaryLabelDataset(
         df=df_aif,
@@ -108,13 +117,9 @@ def apply_reweighing(
     # Build human-readable group weight map
     # priv_mask uses the numeric column in df_work (already converted in _to_bld copy)
     # Use privileged_values to build mask from original column
-    priv_val = config.privileged_values.get(attr, 1)
-    raw_col  = df_work[attr]
-    if raw_col.dtype == object:
-        priv_mask = raw_col == priv_val
-    else:
-        priv_mask = raw_col.astype(float) == 1.0
-    pos_mask   = df_work[config.target_col] == config.positive_label
+    priv_val  = _coerce_priv_val(df_work[attr], config.privileged_values.get(attr, 1))
+    priv_mask = df_work[attr] == priv_val
+    pos_mask  = df_work[config.target_col] == config.positive_label
     group_weight_map = {
         "Privileged+Positive":    float(weights[priv_mask  & pos_mask ].mean()),
         "Privileged+Negative":    float(weights[priv_mask  & ~pos_mask].mean()),
@@ -215,13 +220,10 @@ def compute_before_after(
     def weighted_approval(df, weights, attr_col):
         if attr_col not in df.columns:
             attr_col = f"{attr_col}_binary"
-        raw = df[attr_col]
-        priv_val = config.privileged_values.get(attr, 1)
-        if raw.dtype == object:
-            priv_mask = raw == priv_val
-        else:
-            priv_mask = raw.astype(float) == 1.0
-        pos_mask   = df[config.target_col] == config.positive_label
+        raw       = df[attr_col]
+        priv_val  = _coerce_priv_val(raw, config.privileged_values.get(attr, 1))
+        priv_mask = raw == priv_val
+        pos_mask  = df[config.target_col] == config.positive_label
         w_priv_pos  = weights[priv_mask  & pos_mask ].sum()
         w_priv_all  = weights[priv_mask ].sum()
         w_unpriv_pos = weights[~priv_mask & pos_mask].sum()

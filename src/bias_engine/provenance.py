@@ -82,23 +82,26 @@ def trace_bias_provenance(
     df_clean: pd.DataFrame,
     config: DatasetConfig,
     proxy_scan_results: dict[str, list[ProxyResult]],
+    primary_attr: str | None = None,
     imbalance_ratio_threshold: float = 3.0,
     high_proxy_threshold: float = 0.15,
 ) -> ProvenanceReport:
     """
-    Diagnose the primary source of bias from three signals:
+    Diagnose the primary source of bias from four signals:
       1. Group size imbalance → Representation Bias
       2. High-MI proxy features → Feature Bias
-      3. Default (label distribution skew) → Label Bias
+      3. Label distribution skew → Label Bias
+      4. Disparate Impact magnitude → Label Bias confidence boost
 
     Parameters
     ----------
     df_clean : DataFrame with original string protected attr columns
     proxy_scan_results : output of scan_proxies()
+    primary_attr : which protected attr to analyse (default: config.primary_protected_attr())
     imbalance_ratio_threshold : ratio of largest to smallest group to flag representation bias
     high_proxy_threshold : MI threshold to flag feature bias
     """
-    attr = config.primary_protected_attr()
+    attr = primary_attr or config.primary_protected_attr()
     evidence = []
     scores = {"label_bias": 0.0, "representation_bias": 0.0, "feature_bias": 0.0}
 
@@ -126,7 +129,8 @@ def trace_bias_provenance(
         if r.mutual_info >= high_proxy_threshold
     ]
     if high_mi_proxies:
-        scores["feature_bias"] += 0.5 * min(len(high_mi_proxies), 4) / 4
+        proxy_score = 0.6 * min(len(high_mi_proxies), 4) / 4
+        scores["feature_bias"] += proxy_score
         top_proxy = max(high_mi_proxies, key=lambda r: r.mutual_info)
         evidence.append(
             f"{len(high_mi_proxies)} shadow proxy feature(s) detected. "
@@ -136,26 +140,52 @@ def trace_bias_provenance(
     else:
         evidence.append("No high-MI shadow proxies detected. Feature leakage is not the primary cause.")
 
-    # ── Signal 3: Label distribution skew (label bias default) ───────────────
+    # ── Signal 3: Label distribution skew (label bias) ───────────────────────
     if attr in df_clean.columns:
         target = config.target_col
         pos    = config.positive_label
-        priv_rate   = (df_clean[df_clean[attr] == config.privileged_values[attr]][target] == pos).mean()
-        unpriv_rate = (df_clean[df_clean[attr] != config.privileged_values[attr]][target] == pos).mean()
-        label_ratio = priv_rate / max(unpriv_rate, 1e-9)
-        if label_ratio > 2.0:
-            scores["label_bias"] += 0.7
+        col    = df_clean[attr]
+        priv_val = config.privileged_values[attr]
+        # Coerce priv_val to column dtype for numeric columns (e.g. age as int)
+        if not pd.api.types.is_object_dtype(col):
+            try:
+                priv_val = col.dtype.type(priv_val)
+            except (ValueError, TypeError):
+                pass
+        priv_mask   = col == priv_val
+        priv_rate   = (df_clean.loc[priv_mask,  target] == pos).mean()
+        unpriv_rate = (df_clean.loc[~priv_mask, target] == pos).mean()
+        # Symmetric ratio — detects bias regardless of which group is labelled privileged
+        if priv_rate > 0 and unpriv_rate > 0:
+            label_ratio = max(priv_rate, unpriv_rate) / min(priv_rate, unpriv_rate)
+        elif max(priv_rate, unpriv_rate) > 0:
+            label_ratio = 10.0  # one group has zero positive rate — extreme bias
+        else:
+            label_ratio = 1.0
+        higher_group = "privileged" if priv_rate >= unpriv_rate else "unprivileged"
+        if label_ratio >= 1.5:
+            # Scale: ratio 1.5 → 0.55,  ratio 2 → 0.70,  ratio 4+ → 0.90
+            label_score = min(0.40 + 0.15 * np.log2(label_ratio), 0.90)
+            scores["label_bias"] += label_score
             evidence.append(
-                f"Label distribution skew: privileged group positive rate ({priv_rate:.1%}) "
-                f"is {label_ratio:.1f}× higher than unprivileged ({unpriv_rate:.1%}). "
+                f"Label distribution skew: {higher_group} group positive rate ({max(priv_rate, unpriv_rate):.1%}) "
+                f"is {label_ratio:.1f}× higher than the other group ({min(priv_rate, unpriv_rate):.1%}). "
                 "Historical discrimination likely encoded in target labels."
+            )
+        else:
+            evidence.append(
+                f"Label rates are similar across groups ({priv_rate:.1%} vs {unpriv_rate:.1%}). "
+                "Label bias is unlikely as the primary cause."
             )
 
     # ── Pick primary and secondary ────────────────────────────────────────────
     sorted_scores = sorted(scores.items(), key=lambda t: t[1], reverse=True)
     primary   = sorted_scores[0][0]
     secondary = sorted_scores[1][0] if sorted_scores[1][1] > 0.1 else None
-    confidence = min(sorted_scores[0][1], 1.0)
+    # Confidence: top signal + partial credit for corroborating evidence
+    top_score  = sorted_scores[0][1]
+    other_sum  = sum(s for _, s in sorted_scores[1:])
+    confidence = min(top_score + 0.15 * other_sum, 1.0)
 
     # ── Fixes and cautions ────────────────────────────────────────────────────
     fix_map = {

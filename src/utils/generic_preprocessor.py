@@ -41,6 +41,12 @@ def auto_detect_protected_attrs(
 
         # Keyword match (highest confidence)
         if any(kw in col_lower for kw in PROTECTED_KEYWORDS):
+            # Skip continuous numeric columns — e.g. an "age" column with 60+
+            # distinct integer values cannot be meaningfully split into a
+            # privileged/unprivileged group by a single value.
+            n_unique = df[col].nunique()
+            if df[col].dtype != object and n_unique > 20:
+                continue
             candidates.append(col)
             continue
 
@@ -106,8 +112,12 @@ def preprocess_generic(
     # ── 4. Binarize target: positive_label → 1, anything else → 0 ────────────
     pos = config.positive_label
     df[config.target_col] = (df[config.target_col].astype(str) == str(pos)).astype(int)
-    # Sync binarized target into df_clean (fairness engine uses numeric target)
+    # Sync binarized target into df_clean so the fairness engine compares numeric
+    # 0/1 values against config.positive_label, which we also update to 1.
     df_clean[config.target_col] = df[config.target_col]
+    # CRITICAL: update positive_label to the numeric value (1) so the detector's
+    # comparisons (priv_y == config.positive_label) work on the binarized column.
+    config.positive_label = 1
 
     # ── 5. Encode protected attrs as binary 0/1 (keep original column names) ──
     # df_clean retains original string values for group-split logic in detector.py
