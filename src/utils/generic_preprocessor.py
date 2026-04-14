@@ -128,17 +128,30 @@ def preprocess_generic(
         df[attr] = (df[attr].astype(str) == str(priv_val)).astype(int)
         # df_clean[attr] is untouched (still has "Male"/"Female" etc.)
 
-    # ── 6. Ordinal-encode remaining categorical columns ───────────────────────
+    # ── 6. Ordinal-encode remaining categorical / non-numeric columns ─────────
+    # Use is_numeric_dtype instead of dtype == object so that Arrow-backed
+    # StringDtype columns (e.g. time strings like "17:02:00") are also caught.
     cat_cols = [
         c for c in df.columns
-        if df[c].dtype == object and c != config.target_col
+        if not pd.api.types.is_numeric_dtype(df[c]) and c != config.target_col
     ]
     if cat_cols:
+        # Cast to plain Python str first so OrdinalEncoder handles any dtype
+        df[cat_cols] = df[cat_cols].astype(str)
         enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
         df[cat_cols] = enc.fit_transform(df[cat_cols])
 
     # ── 7. Build feature matrix X and target y ────────────────────────────────
     feature_cols = [c for c in df.columns if c != config.target_col]
+
+    # Catch-all: coerce any column that still can't cast to float (e.g. mixed
+    # types, object columns that slipped through) rather than crashing.
+    for col in feature_cols:
+        try:
+            df[col].astype(float)
+        except (ValueError, TypeError):
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(-1)
+
     X = df[feature_cols].astype(float)
     y = df[config.target_col].astype(int)
 

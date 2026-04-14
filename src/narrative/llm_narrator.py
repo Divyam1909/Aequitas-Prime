@@ -1,36 +1,27 @@
 """
-LLM-Powered Audit Narrative — V2: pluggable multi-provider backend.
+LLM-Powered Audit Narrative — Gemini-only backend.
 
-Supported providers:
-  "gemini"  — Google Gemini API (default, free tier)
-  "openai"  — OpenAI GPT-4o / GPT-3.5-turbo
-  "claude"  — Anthropic Claude (claude-sonnet-4-6 default)
-  "ollama"  — Local Ollama server (llama3, mistral, etc.)
-  "none"    — Rule-based fallback only
+All AI features use Google Gemini (gemini-2.0-flash) via the
+google-generativeai SDK.  Get a free key at aistudio.google.com/apikey.
 
-Provider selection (priority order):
-  1. Explicit api_key / provider arguments to generate_audit_narrative()
-  2. st.secrets (Streamlit Cloud deployment)
-  3. Environment variables: GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY
-  4. Auto-detect: first key found wins
-  5. Fallback narrative (no external calls)
+Public API:
+  generate_audit_narrative()   — full narrative string (non-streaming)
+  stream_audit_narrative()     — streaming version for Streamlit
+  generate_risk_scorecard()    — structured JSON risk scorecard via Gemini
+  ask_remediation_chat()       — single-turn or multi-turn Q&A about the audit
+  suggest_sensitive_columns()  — auto-detect protected attributes from CSV columns
 """
 
 from __future__ import annotations
 import os
+import json
 from typing import Generator
 
 from src.ml_pipeline.evaluator import EvalResult
 from src.bias_engine.provenance import ProvenanceReport
 from src.bias_engine.proxy_scanner import ProxyResult
 
-# ── Default model names per provider ──────────────────────────────────────────
-DEFAULT_MODELS = {
-    "gemini": "gemini-2.0-flash",
-    "openai": "gpt-4o-mini",
-    "claude": "claude-sonnet-4-6",
-    "ollama": "llama3",
-}
+GEMINI_MODEL = "gemini-2.0-flash"
 
 SYSTEM_PROMPT = """You are an expert AI fairness auditor writing a compliance report.
 Your audience is a Chief Compliance Officer or legal counsel — not a data scientist.
@@ -43,29 +34,30 @@ Keep the total response to 4 short paragraphs:
 Be honest about limitations. Do not oversell the mitigation."""
 
 
-def _streamlit_secret(key: str) -> str:
+def _get_gemini_key(api_key: str | None = None) -> str:
+    """Resolve Gemini API key from explicit arg → st.secrets → env var."""
+    if api_key:
+        return api_key
     try:
         import streamlit as st
-        return st.secrets.get(key, "")
-    except Exception:
-        return ""
-
-
-def _auto_detect_provider() -> tuple[str, str]:
-    """
-    Return (provider_name, api_key) for the first available provider.
-    Returns ("none", "") if nothing is configured.
-    """
-    checks = [
-        ("gemini", "GEMINI_API_KEY"),
-        ("openai", "OPENAI_API_KEY"),
-        ("claude", "ANTHROPIC_API_KEY"),
-    ]
-    for provider, env_var in checks:
-        key = os.environ.get(env_var, "") or _streamlit_secret(env_var)
+        key = st.secrets.get("GEMINI_API_KEY", "")
         if key:
-            return provider, key
-    return "none", ""
+            return key
+    except Exception:
+        pass
+    return os.environ.get("GEMINI_API_KEY", "")
+
+
+def _configure_gemini(api_key: str | None = None):
+    import google.generativeai as genai
+    key = _get_gemini_key(api_key)
+    if not key:
+        raise ValueError(
+            "No Gemini API key found. Set GEMINI_API_KEY environment variable "
+            "or pass api_key= to the function. Free key: aistudio.google.com/apikey"
+        )
+    genai.configure(api_key=key)
+    return genai
 
 
 def _build_metrics_prompt(
@@ -123,120 +115,26 @@ def _build_metrics_prompt(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Provider-specific generation helpers
+# Core Gemini helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _generate_gemini(prompt: str, api_key: str, model: str) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    gm = genai.GenerativeModel(model_name=model, system_instruction=SYSTEM_PROMPT)
+def _generate_gemini(prompt: str, api_key: str | None = None) -> str:
+    genai = _configure_gemini(api_key)
+    gm = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_PROMPT)
     resp = gm.generate_content(prompt)
     return resp.text.strip()
 
 
-def _stream_gemini(prompt: str, api_key: str, model: str) -> Generator[str, None, None]:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    gm = genai.GenerativeModel(model_name=model, system_instruction=SYSTEM_PROMPT)
+def _stream_gemini(prompt: str, api_key: str | None = None) -> Generator[str, None, None]:
+    genai = _configure_gemini(api_key)
+    gm = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_PROMPT)
     for chunk in gm.generate_content(prompt, stream=True):
         if chunk.text:
             yield chunk.text
 
 
-def _generate_openai(prompt: str, api_key: str, model: str) -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        temperature=0.3,
-    )
-    return resp.choices[0].message.content.strip()
-
-
-def _stream_openai(prompt: str, api_key: str, model: str) -> Generator[str, None, None]:
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-    stream = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        temperature=0.3,
-        stream=True,
-    )
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
-
-
-def _generate_claude(prompt: str, api_key: str, model: str) -> str:
-    import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return msg.content[0].text.strip()
-
-
-def _stream_claude(prompt: str, api_key: str, model: str) -> Generator[str, None, None]:
-    import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
-    with client.messages.stream(
-        model=model,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
-
-
-def _generate_ollama(prompt: str, model: str, base_url: str = "http://localhost:11434") -> str:
-    import requests, json
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        "stream": False,
-    }
-    resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=120)
-    resp.raise_for_status()
-    return resp.json()["message"]["content"].strip()
-
-
-def _stream_ollama(prompt: str, model: str, base_url: str = "http://localhost:11434") -> Generator[str, None, None]:
-    import requests, json
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        "stream": True,
-    }
-    with requests.post(f"{base_url}/api/chat", json=payload, stream=True, timeout=120) as resp:
-        resp.raise_for_status()
-        for line in resp.iter_lines():
-            if line:
-                data = json.loads(line)
-                delta = data.get("message", {}).get("content", "")
-                if delta:
-                    yield delta
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# Public API
+# Public API — Narrative
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_audit_narrative(
@@ -247,65 +145,23 @@ def generate_audit_narrative(
     dataset_name: str,
     primary_attr: str,
     api_key: str | None = None,
+    # legacy params kept for backwards-compat, ignored
     provider: str | None = None,
     model: str | None = None,
-    ollama_base_url: str = "http://localhost:11434",
+    ollama_base_url: str = "",
 ) -> str:
-    """
-    Generate a plain-English audit narrative using the configured LLM.
-
-    provider : one of "gemini", "openai", "claude", "ollama", "none".
-               If None, auto-detects from environment variables.
-    model    : model name override (e.g. "gpt-4o", "claude-opus-4-6").
-               Defaults to DEFAULT_MODELS[provider].
-    api_key  : explicit key (overrides env vars).
-
-    Returns narrative string; falls back to rule-based if API unavailable.
-    """
-    # Resolve provider + key
-    if provider is None or provider == "none":
-        prov, key = _auto_detect_provider()
-        if api_key:
-            key = api_key
-    else:
-        prov = provider
-        key  = (
-            api_key
-            or os.environ.get({
-                "gemini": "GEMINI_API_KEY",
-                "openai": "OPENAI_API_KEY",
-                "claude": "ANTHROPIC_API_KEY",
-            }.get(prov, ""), "")
-            or _streamlit_secret({
-                "gemini": "GEMINI_API_KEY",
-                "openai": "OPENAI_API_KEY",
-                "claude": "ANTHROPIC_API_KEY",
-            }.get(prov, ""))
-        )
-
-    if prov == "none" or not key and prov != "ollama":
-        return _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
-
-    mdl = model or DEFAULT_MODELS.get(prov, "")
+    """Generate a plain-English audit narrative using Gemini."""
     metrics_text = _build_metrics_prompt(
         baseline_eval, best_eval, proxy_results, provenance, dataset_name, primary_attr
     )
-
+    key = _get_gemini_key(api_key)
+    if not key:
+        return _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
     try:
-        if prov == "gemini":
-            return _generate_gemini(metrics_text, key, mdl)
-        elif prov == "openai":
-            return _generate_openai(metrics_text, key, mdl)
-        elif prov == "claude":
-            return _generate_claude(metrics_text, key, mdl)
-        elif prov == "ollama":
-            return _generate_ollama(metrics_text, mdl, ollama_base_url)
-        else:
-            return _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
+        return _generate_gemini(metrics_text, key)
     except Exception as e:
-        return (
-            f"[LLM Narrative] {prov} error: {e}\n\n"
-            + _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
+        return f"[Gemini error: {e}]\n\n" + _fallback_narrative(
+            baseline_eval, best_eval, primary_attr, provenance
         )
 
 
@@ -317,55 +173,220 @@ def stream_audit_narrative(
     dataset_name: str,
     primary_attr: str,
     api_key: str | None = None,
+    # legacy params kept for backwards-compat, ignored
     provider: str | None = None,
     model: str | None = None,
-    ollama_base_url: str = "http://localhost:11434",
+    ollama_base_url: str = "",
 ) -> Generator[str, None, None]:
     """Streaming version — yields text chunks for Streamlit st.write_stream()."""
-    if provider is None or provider == "none":
-        prov, key = _auto_detect_provider()
-        if api_key:
-            key = api_key
-    else:
-        prov = provider
-        key  = (
-            api_key
-            or os.environ.get({
-                "gemini": "GEMINI_API_KEY",
-                "openai": "OPENAI_API_KEY",
-                "claude": "ANTHROPIC_API_KEY",
-            }.get(prov, ""), "")
-            or _streamlit_secret({
-                "gemini": "GEMINI_API_KEY",
-                "openai": "OPENAI_API_KEY",
-                "claude": "ANTHROPIC_API_KEY",
-            }.get(prov, ""))
-        )
-
-    if prov == "none" or not key and prov != "ollama":
+    metrics_text = _build_metrics_prompt(
+        baseline_eval, best_eval, proxy_results, provenance, dataset_name, primary_attr
+    )
+    key = _get_gemini_key(api_key)
+    if not key:
         yield _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
         return
+    try:
+        yield from _stream_gemini(metrics_text, key)
+    except Exception as e:
+        yield f"[Gemini error: {e}]\n\n"
+        yield _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
 
-    mdl = model or DEFAULT_MODELS.get(prov, "")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Public API — Risk Scorecard (Gemini JSON mode)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SCORECARD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overall_risk": {"type": "string", "enum": ["Low", "Medium", "High", "Critical"]},
+        "overall_risk_score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "legal_exposure": {"type": "string", "enum": ["Low", "Medium", "High"]},
+        "deployment_recommendation": {
+            "type": "string",
+            "enum": ["Deploy", "Deploy with monitoring", "Defer — remediate first", "Block deployment"]
+        },
+        "dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "status": {"type": "string", "enum": ["Pass", "Warning", "Fail"]},
+                    "finding": {"type": "string"}
+                }
+            }
+        },
+        "top_actions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 3
+        },
+        "applicable_regulations": {
+            "type": "array",
+            "items": {"type": "string"}
+        }
+    }
+}
+
+
+def generate_risk_scorecard(
+    baseline_eval: EvalResult,
+    best_eval: EvalResult,
+    proxy_results: list[ProxyResult],
+    provenance: ProvenanceReport,
+    dataset_name: str,
+    primary_attr: str,
+    api_key: str | None = None,
+) -> dict | None:
+    """
+    Use Gemini's JSON-mode output to produce a structured compliance risk scorecard.
+    Returns a dict matching SCORECARD_SCHEMA, or None if the API key is missing.
+    """
+    key = _get_gemini_key(api_key)
+    if not key:
+        return None
+
     metrics_text = _build_metrics_prompt(
         baseline_eval, best_eval, proxy_results, provenance, dataset_name, primary_attr
     )
 
-    try:
-        if prov == "gemini":
-            yield from _stream_gemini(metrics_text, key, mdl)
-        elif prov == "openai":
-            yield from _stream_openai(metrics_text, key, mdl)
-        elif prov == "claude":
-            yield from _stream_claude(metrics_text, key, mdl)
-        elif prov == "ollama":
-            yield from _stream_ollama(metrics_text, mdl, ollama_base_url)
-        else:
-            yield _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
-    except Exception as e:
-        yield f"[LLM Narrative] {prov} error: {e}\n\n"
-        yield _fallback_narrative(baseline_eval, best_eval, primary_attr, provenance)
+    scorecard_prompt = (
+        f"{metrics_text}\n\n"
+        "Based on the audit data above, produce a structured compliance risk scorecard. "
+        "Score each dimension from 0 (worst) to 100 (best). "
+        "Be conservative — err on the side of flagging risk. "
+        "Return ONLY valid JSON matching the schema provided."
+    )
 
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        gm = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            generation_config={"response_mime_type": "application/json"},
+        )
+        resp = gm.generate_content(scorecard_prompt)
+        return json.loads(resp.text)
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Public API — Remediation Chatbot
+# ══════════════════════════════════════════════════════════════════════════════
+
+CHATBOT_SYSTEM = """You are a helpful AI fairness advisor embedded in an audit tool.
+The user has just run a bias audit on their ML model. Answer their questions about
+the results clearly and concisely — 2–4 sentences max per response.
+Use plain language. If asked for code, provide a short Python snippet.
+Never make up metric values; only refer to data provided in the conversation."""
+
+
+def ask_remediation_chat(
+    user_message: str,
+    audit_context: str,
+    chat_history: list[dict] | None = None,
+    api_key: str | None = None,
+) -> str:
+    """
+    Single-turn or multi-turn Q&A about the audit using Gemini chat.
+
+    Parameters
+    ----------
+    user_message   : the user's question
+    audit_context  : a string summary of the current audit (from _build_metrics_prompt)
+    chat_history   : list of {"role": "user"|"model", "parts": [str]} dicts
+                     (pass st.session_state["gemini_chat_history"] directly)
+    api_key        : Gemini API key
+
+    Returns
+    -------
+    str  — Gemini's response text
+    """
+    key = _get_gemini_key(api_key)
+    if not key:
+        return "No Gemini API key found. Add your key in the sidebar to use the AI advisor."
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        gm = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=CHATBOT_SYSTEM,
+        )
+
+        # Prepend audit context as the very first user turn if history is empty
+        history = list(chat_history) if chat_history else []
+        if not history:
+            history = [
+                {"role": "user",  "parts": [f"Here is the audit context:\n\n{audit_context}"]},
+                {"role": "model", "parts": ["Understood. I have reviewed the audit results. What would you like to know?"]},
+            ]
+
+        chat = gm.start_chat(history=history)
+        resp = chat.send_message(user_message)
+        return resp.text.strip()
+    except Exception as e:
+        return f"Gemini error: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Public API — Dataset Column Advisor
+# ══════════════════════════════════════════════════════════════════════════════
+
+def suggest_sensitive_columns(
+    column_names: list[str],
+    sample_values: dict[str, list],
+    api_key: str | None = None,
+) -> dict | None:
+    """
+    Given a list of column names and a few sample values, ask Gemini to identify
+    which columns are likely protected attributes, the target label, and proxy risks.
+
+    Returns a dict with keys:
+      protected_attrs : list[str]
+      target_col      : str | None
+      proxy_risks     : list[str]
+      reasoning       : str
+    Or None if no API key is available.
+    """
+    key = _get_gemini_key(api_key)
+    if not key:
+        return None
+
+    col_summary = "\n".join(
+        f"  - {col}: sample values = {vals[:5]}"
+        for col, vals in sample_values.items()
+    )
+    prompt = (
+        f"A dataset has these columns:\n{col_summary}\n\n"
+        "Identify which columns are likely:\n"
+        "1. Protected attributes (race, gender, age, religion, national origin, disability, etc.)\n"
+        "2. The target/label column (what the model predicts)\n"
+        "3. Proxy risk columns (correlate with protected attributes: zip code, school, surname)\n\n"
+        "Return ONLY valid JSON with keys: "
+        "protected_attrs (list), target_col (string or null), proxy_risks (list), reasoning (string)."
+    )
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        gm = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            generation_config={"response_mime_type": "application/json"},
+        )
+        resp = gm.generate_content(prompt)
+        return json.loads(resp.text)
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fallback (no API key)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _fallback_narrative(
     baseline_eval: EvalResult,
@@ -373,7 +394,7 @@ def _fallback_narrative(
     primary_attr: str,
     provenance: ProvenanceReport,
 ) -> str:
-    """Rule-based fallback when no LLM API is available."""
+    """Rule-based fallback when no Gemini API key is available."""
     bm = baseline_eval.fairness.get(primary_attr)
     am = best_eval.fairness.get(primary_attr)
     di_b = bm.disparate_impact if bm else float("nan")

@@ -8,7 +8,7 @@ V2 additions:
   - Intersectional small-group Wilson CI
   - Group SHAP comparison in Surgeon
   - Causal Fairness tab (mediation)
-  - Multi-provider LLM selector (Gemini / OpenAI / Claude / Ollama)
+  - Google Gemini AI: narrative, risk scorecard, remediation chatbot, column advisor
   - Audit persistence: Save + History
   - String labels in Counterfactual Panel
 """
@@ -539,46 +539,22 @@ with st.sidebar:
 
     st.divider()
 
-    # ── V2: Multi-provider LLM config ─────────────────────────────────────────
-    st.markdown('<span style="color:#8b949e;font-size:0.82rem">AI NARRATIVE PROVIDER</span>', unsafe_allow_html=True)
-    llm_provider = st.selectbox(
-        "Provider", options=["gemini", "openai", "claude", "ollama", "none"],
-        index=0, key="llm_provider",
-        label_visibility="collapsed",
-        help="gemini=free via aistudio.google.com | openai=GPT-4o-mini | claude=Sonnet | ollama=local | none=fallback"
+    # ── Gemini AI config ───────────────────────────────────────────────────────
+    st.markdown('<span style="color:#8b949e;font-size:0.82rem">GOOGLE GEMINI AI</span>', unsafe_allow_html=True)
+    _gemini_key = st.text_input(
+        "Gemini API Key", type="password",
+        value=os.environ.get("GEMINI_API_KEY", ""),
+        label_visibility="collapsed", key="llm_key_gemini",
+        help="Free key at aistudio.google.com/apikey  •  15 req/min, 1M tokens/day",
     )
-    st.session_state["_llm_provider"] = llm_provider
-
-    if llm_provider == "gemini":
-        _key = st.text_input("Gemini API Key", type="password",
-                              value=os.environ.get("GEMINI_API_KEY", ""),
-                              label_visibility="collapsed", key="llm_key_gemini",
-                              help="Free key at aistudio.google.com/apikey")
-        if _key:
-            os.environ["GEMINI_API_KEY"] = _key
-        st.session_state["_llm_api_key"] = _key
-    elif llm_provider == "openai":
-        _key = st.text_input("OpenAI API Key", type="password",
-                              value=os.environ.get("OPENAI_API_KEY", ""),
-                              label_visibility="collapsed", key="llm_key_openai")
-        if _key:
-            os.environ["OPENAI_API_KEY"] = _key
-        st.session_state["_llm_api_key"] = _key
-    elif llm_provider == "claude":
-        _key = st.text_input("Anthropic API Key", type="password",
-                              value=os.environ.get("ANTHROPIC_API_KEY", ""),
-                              label_visibility="collapsed", key="llm_key_claude")
-        if _key:
-            os.environ["ANTHROPIC_API_KEY"] = _key
-        st.session_state["_llm_api_key"] = _key
-    elif llm_provider == "ollama":
-        ollama_url = st.text_input("Ollama URL", value="http://localhost:11434",
-                                    label_visibility="collapsed", key="llm_ollama_url")
-        st.session_state["_llm_ollama_url"] = ollama_url
-        st.session_state["_llm_api_key"] = ""
+    if _gemini_key:
+        os.environ["GEMINI_API_KEY"] = _gemini_key
+    st.session_state["_llm_api_key"] = _gemini_key
+    st.session_state["_llm_provider"] = "gemini"
+    if _gemini_key:
+        st.markdown('<span style="color:#3fb950;font-size:0.75rem">✓ Gemini connected — AI features enabled.</span>', unsafe_allow_html=True)
     else:
-        st.session_state["_llm_api_key"] = ""
-    st.markdown('<span style="color:#6b7280;font-size:0.75rem">Leave blank — fallback narrative auto-generates.</span>', unsafe_allow_html=True)
+        st.markdown('<span style="color:#6b7280;font-size:0.75rem">Leave blank — rule-based fallback auto-generates.</span>', unsafe_allow_html=True)
 
     st.divider()
 
@@ -851,6 +827,47 @@ with tab1:
 
     with st.expander(f"📋 Dataset Preview — {len(raw_df):,} rows × {len(raw_df.columns)} columns", expanded=False):
         st.dataframe(raw_df.head(10), use_container_width=True)
+
+    # ── Gemini Dataset Column Advisor ─────────────────────────────────────────
+    _adv_key = st.session_state.get("_llm_api_key", "")
+    if _adv_key and not is_demo:
+        _adv_cache_key = f"_col_advice_{st.session_state.get('_last_upload_name','')}"
+        if _adv_cache_key not in st.session_state:
+            if st.button("✨ Gemini: Auto-detect Protected Attributes", key="btn_col_advisor",
+                         help="Gemini analyses your column names and sample values to suggest protected attributes, target column, and proxy risks."):
+                with st.spinner("Gemini is analysing your dataset columns..."):
+                    try:
+                        from src.narrative.llm_narrator import suggest_sensitive_columns
+                        _sample_vals = {
+                            col: raw_df[col].dropna().unique()[:5].tolist()
+                            for col in raw_df.columns
+                        }
+                        _advice = suggest_sensitive_columns(
+                            list(raw_df.columns), _sample_vals, api_key=_adv_key
+                        )
+                        if _advice:
+                            st.session_state[_adv_cache_key] = _advice
+                    except Exception as _ae:
+                        st.warning(f"Gemini column advisor error: {_ae}")
+
+        if _adv_cache_key in st.session_state:
+            _adv = st.session_state[_adv_cache_key]
+            with st.expander("✨ Gemini Column Advisor — click to see suggestions", expanded=True):
+                _ca1, _ca2 = st.columns(2)
+                with _ca1:
+                    st.markdown("**Likely protected attributes:**")
+                    for _pa in _adv.get("protected_attrs", []):
+                        st.markdown(f"- `{_pa}`")
+                    if _adv.get("target_col"):
+                        st.markdown(f"**Likely target column:** `{_adv['target_col']}`")
+                with _ca2:
+                    if _adv.get("proxy_risks"):
+                        st.markdown("**Proxy risk columns:**")
+                        for _pr in _adv.get("proxy_risks", []):
+                            st.markdown(f"- `{_pr}`")
+                if _adv.get("reasoning"):
+                    st.caption(_adv["reasoning"])
+                st.info("Use these suggestions when configuring the audit below.")
 
     st.divider()
 
@@ -2396,12 +2413,10 @@ with tab6:
             st.caption(f"SHAP explanation unavailable: {e}")
 
         st.divider()
-        _g_prov = st.session_state.get("_llm_provider", "gemini")
-        _g_key  = st.session_state.get("_llm_api_key", "")
-        _g_has  = (_g_prov in ("gemini","openai","claude") and bool(_g_key)) or _g_prov == "ollama"
-        if _g_has or _g_prov == "none":
-            if st.button(f"✨ Generate Plain-English Explanation ({_g_prov.title()})"):
-                with st.spinner(f"Asking {_g_prov.title()}..."):
+        _g_key = st.session_state.get("_llm_api_key", "")
+        if _g_key:
+            if st.button("✨ Explain with Gemini AI"):
+                with st.spinner("Gemini is explaining this prediction..."):
                     try:
                         try:
                             top3 = [(f, round(v, 3)) for f, _, v in drivers[:3]]
@@ -2416,41 +2431,14 @@ with tab6:
                             "Explain this decision in 2 plain sentences a non-technical person could understand. "
                             "Then explain what the Counterfactual Ghost result means for fairness in one sentence."
                         )
-                        if _g_prov == "gemini":
-                            import google.generativeai as genai
-                            genai.configure(api_key=_g_key)
-                            gm = genai.GenerativeModel("gemini-2.0-flash")
-                            st.info(gm.generate_content(_expl_prompt).text)
-                        elif _g_prov == "openai":
-                            from openai import OpenAI
-                            _cl = OpenAI(api_key=_g_key)
-                            _resp = _cl.chat.completions.create(
-                                model="gpt-4o-mini",
-                                messages=[{"role":"user","content":_expl_prompt}],
-                                temperature=0.3,
-                            )
-                            st.info(_resp.choices[0].message.content.strip())
-                        elif _g_prov == "claude":
-                            import anthropic
-                            _cl = anthropic.Anthropic(api_key=_g_key)
-                            _msg = _cl.messages.create(
-                                model="claude-sonnet-4-6", max_tokens=512,
-                                messages=[{"role":"user","content":_expl_prompt}],
-                            )
-                            st.info(_msg.content[0].text.strip())
-                        elif _g_prov == "ollama":
-                            import requests as _req, json as _json
-                            _ollurl = st.session_state.get("_llm_ollama_url","http://localhost:11434")
-                            _r = _req.post(f"{_ollurl}/api/chat",
-                                           json={"model":"llama3","messages":[{"role":"user","content":_expl_prompt}],"stream":False},
-                                           timeout=60)
-                            st.info(_r.json()["message"]["content"])
-                        else:
-                            st.info(_expl_prompt)
+                        import google.generativeai as genai
+                        genai.configure(api_key=_g_key)
+                        gm = genai.GenerativeModel("gemini-2.0-flash")
+                        st.info(gm.generate_content(_expl_prompt).text)
                     except Exception as _ge:
-                        st.warning(f"{_g_prov} error: {_ge}")
+                        st.warning(f"Gemini error: {_ge}")
         else:
-            hint(f"Set an API key for <b>{_g_prov}</b> in the sidebar to get plain-English explanations of any prediction.")
+            hint("Add your <b>Gemini API key</b> in the sidebar to get plain-English explanations of any prediction.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2471,19 +2459,16 @@ with tab7:
     primary = result.config.primary_protected_attr()
 
     # ── AI Narrative ───────────────────────────────────────────────────────────
-    section("AI-Generated Audit Narrative")
+    section("Gemini AI — Audit Narrative")
     hint(
-        "Translates bias metrics into a plain-English document suitable for compliance officers and regulators. "
+        "Gemini translates bias metrics into a plain-English compliance document for officers and regulators. "
         "Covers: what bias was found, why it exists, what was done, what risks remain, and which regulations apply. "
         "<b>This is what a compliance officer needs to sign off on AI deployment.</b>"
     )
 
-    # V2: multi-provider LLM
-    _llm_prov    = st.session_state.get("_llm_provider", "gemini")
-    _llm_key     = st.session_state.get("_llm_api_key", "")
-    _llm_ollama  = st.session_state.get("_llm_ollama_url", "http://localhost:11434")
-    prov         = st.session_state.get("provenance")
-    best_eval    = result.inprocessed_eval or result.preprocessed_eval
+    _llm_key  = st.session_state.get("_llm_api_key", "")
+    prov      = st.session_state.get("provenance")
+    best_eval = result.inprocessed_eval or result.preprocessed_eval
 
     if "narrative" not in st.session_state and prov and best_eval:
         from src.narrative.llm_narrator import _fallback_narrative
@@ -2492,41 +2477,28 @@ with tab7:
         from src.narrative.llm_narrator import _fallback_narrative
         st.session_state["narrative"] = _fallback_narrative(result.baseline_eval, result.baseline_eval, primary, prov)
 
-    _has_llm = (_llm_prov in ("gemini","openai","claude") and bool(_llm_key)) or _llm_prov == "ollama"
-    _btn_label = {
-        "gemini": "✨ Generate Narrative with Gemini AI",
-        "openai": "✨ Generate Narrative with OpenAI",
-        "claude": "✨ Generate Narrative with Claude",
-        "ollama": "✨ Generate Narrative with Ollama (local)",
-        "none":   "✨ Generate Rule-Based Narrative",
-    }.get(_llm_prov, "✨ Generate Narrative")
-
-    if _has_llm or _llm_prov == "none":
-        if st.button(_btn_label, use_container_width=True):
-            if prov:
-                from src.narrative.llm_narrator import stream_audit_narrative
-                from src.bias_engine.proxy_scanner import get_flagged_proxies
-                flagged = get_flagged_proxies(result.proxy_scan)
-                eval_for_narr = best_eval or result.baseline_eval
-                with st.spinner(f"{_llm_prov.title()} is writing your compliance narrative..."):
-                    narrative = ""
-                    box = st.empty()
-                    for chunk in stream_audit_narrative(
-                        result.baseline_eval, eval_for_narr, flagged, prov,
-                        result.dataset_name, primary,
-                        provider=_llm_prov,
-                        api_key=_llm_key or None,
-                        ollama_base_url=_llm_ollama,
-                    ):
-                        narrative += chunk
-                        box.markdown(narrative)
-                st.session_state["narrative"] = narrative
-                st.success("Narrative generated. Scroll down to download the PDF.")
-            else:
-                st.warning("Run Tab 1 first to generate provenance data.")
-    else:
-        hint(f"No API key set for <b>{_llm_prov}</b> — showing auto-generated rule-based narrative. "
-             "Add your key or switch provider in the sidebar.")
+    _narr_label = "✨ Generate Narrative with Gemini AI" if _llm_key else "✨ Generate Rule-Based Narrative"
+    if st.button(_narr_label, use_container_width=True):
+        if prov:
+            from src.narrative.llm_narrator import stream_audit_narrative
+            from src.bias_engine.proxy_scanner import get_flagged_proxies
+            flagged = get_flagged_proxies(result.proxy_scan)
+            eval_for_narr = best_eval or result.baseline_eval
+            spinner_msg = "Gemini is writing your compliance narrative..." if _llm_key else "Generating rule-based narrative..."
+            with st.spinner(spinner_msg):
+                narrative = ""
+                box = st.empty()
+                for chunk in stream_audit_narrative(
+                    result.baseline_eval, eval_for_narr, flagged, prov,
+                    result.dataset_name, primary,
+                    api_key=_llm_key or None,
+                ):
+                    narrative += chunk
+                    box.markdown(narrative)
+            st.session_state["narrative"] = narrative
+            st.success("Narrative generated. Scroll down to download the PDF.")
+        else:
+            st.warning("Run Tab 1 first to generate provenance data.")
 
     if "narrative" in st.session_state:
         st.markdown("""
@@ -2535,6 +2507,76 @@ with tab7:
         """, unsafe_allow_html=True)
         st.markdown(st.session_state["narrative"])
         st.markdown("</div>", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Gemini Risk Scorecard ──────────────────────────────────────────────────
+    section("Gemini AI — Compliance Risk Scorecard")
+    hint(
+        "Gemini analyses the audit metrics and produces a <b>structured risk scorecard</b> using JSON-mode output. "
+        "Each dimension is scored 0–100 with a Pass / Warning / Fail status, and Gemini gives a deployment recommendation."
+    )
+    if _llm_key:
+        if st.button("📊 Generate Risk Scorecard", use_container_width=True, key="btn_scorecard"):
+            with st.spinner("Gemini is scoring your model's compliance risk..."):
+                try:
+                    from src.narrative.llm_narrator import generate_risk_scorecard
+                    from src.bias_engine.proxy_scanner import get_flagged_proxies
+                    _sc_prov = st.session_state.get("provenance")
+                    _sc_best = result.inprocessed_eval or result.preprocessed_eval or result.baseline_eval
+                    _sc_flagged = get_flagged_proxies(result.proxy_scan)
+                    scorecard = generate_risk_scorecard(
+                        result.baseline_eval, _sc_best,
+                        _sc_flagged, _sc_prov,
+                        result.dataset_name, primary,
+                        api_key=_llm_key,
+                    )
+                    st.session_state["gemini_scorecard"] = scorecard
+                except Exception as _se:
+                    st.error(f"Scorecard generation failed: {_se}")
+
+        if "gemini_scorecard" in st.session_state and st.session_state["gemini_scorecard"]:
+            sc = st.session_state["gemini_scorecard"]
+            _risk_colors = {"Low": "#3fb950", "Medium": "#d29922", "High": "#f85149", "Critical": "#ff0000"}
+            _rec_colors  = {"Deploy": "#3fb950", "Deploy with monitoring": "#d29922",
+                            "Defer — remediate first": "#f85149", "Block deployment": "#ff0000"}
+            _sc_risk = sc.get("overall_risk", "Unknown")
+            _sc_rec  = sc.get("deployment_recommendation", "Unknown")
+            _sc_score = sc.get("overall_risk_score", 0)
+            _sc_legal = sc.get("legal_exposure", "Unknown")
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(f"<div style='text-align:center'><span style='font-size:2rem;font-weight:700;color:{_risk_colors.get(_sc_risk,\"#fff\")}'>{_sc_risk}</span><br><span style='color:#8b949e;font-size:0.75rem'>RISK LEVEL</span></div>", unsafe_allow_html=True)
+            with c2:
+                st.markdown(f"<div style='text-align:center'><span style='font-size:2rem;font-weight:700'>{_sc_score}</span><span style='color:#8b949e'>/100</span><br><span style='color:#8b949e;font-size:0.75rem'>RISK SCORE</span></div>", unsafe_allow_html=True)
+            with c3:
+                st.markdown(f"<div style='text-align:center'><span style='font-size:1.1rem;font-weight:700;color:{_risk_colors.get(_sc_legal,\"#fff\")}'>{_sc_legal}</span><br><span style='color:#8b949e;font-size:0.75rem'>LEGAL EXPOSURE</span></div>", unsafe_allow_html=True)
+            with c4:
+                st.markdown(f"<div style='text-align:center'><span style='font-size:0.85rem;font-weight:700;color:{_rec_colors.get(_sc_rec,\"#fff\")}'>{_sc_rec}</span><br><span style='color:#8b949e;font-size:0.75rem'>RECOMMENDATION</span></div>", unsafe_allow_html=True)
+
+            if sc.get("dimensions"):
+                st.markdown("**Dimension Breakdown**")
+                _status_colors = {"Pass": "#3fb950", "Warning": "#d29922", "Fail": "#f85149"}
+                _dim_rows = []
+                for d in sc["dimensions"]:
+                    _dim_rows.append({
+                        "Dimension": d.get("name", ""),
+                        "Score": d.get("score", 0),
+                        "Status": d.get("status", ""),
+                        "Finding": d.get("finding", ""),
+                    })
+                st.dataframe(pd.DataFrame(_dim_rows), use_container_width=True, hide_index=True)
+
+            if sc.get("top_actions"):
+                st.markdown("**Top Remediation Actions**")
+                for i, action in enumerate(sc["top_actions"], 1):
+                    st.markdown(f"{i}. {action}")
+
+            if sc.get("applicable_regulations"):
+                st.caption("Applicable regulations: " + " | ".join(sc["applicable_regulations"]))
+    else:
+        hint("Add your <b>Gemini API key</b> in the sidebar to generate a structured risk scorecard.")
 
     st.divider()
 
@@ -2639,3 +2681,81 @@ with tab7:
         with col_desc:  st.markdown(f"<span style='color:#c9d1d9;font-size:0.88rem'>{desc}</span>", unsafe_allow_html=True)
         with col_pen:   st.markdown(f"<span style='color:#d97706;font-size:0.82rem'>{penalty}</span>", unsafe_allow_html=True)
         st.markdown("<hr style='border-color:#21262d;margin:0.4rem 0'>", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Gemini Remediation Chatbot ─────────────────────────────────────────────
+    section("Gemini AI — Fairness Advisor Chat")
+    hint(
+        "Ask Gemini anything about your audit results. "
+        "Examples: <i>\"Why is my Disparate Impact below 0.80?\"</i>, "
+        "<i>\"What Python code fixes label bias?\"</i>, "
+        "<i>\"Which EU AI Act articles apply to me?\"</i>"
+    )
+
+    _chat_key = st.session_state.get("_llm_api_key", "")
+    if _chat_key:
+        # Build audit context string once
+        if "gemini_audit_context" not in st.session_state:
+            try:
+                from src.narrative.llm_narrator import _build_metrics_prompt
+                from src.bias_engine.proxy_scanner import get_flagged_proxies
+                _ctx_prov = st.session_state.get("provenance")
+                _ctx_best = result.inprocessed_eval or result.preprocessed_eval or result.baseline_eval
+                _ctx_flagged = get_flagged_proxies(result.proxy_scan)
+                if _ctx_prov:
+                    st.session_state["gemini_audit_context"] = _build_metrics_prompt(
+                        result.baseline_eval, _ctx_best,
+                        _ctx_flagged, _ctx_prov,
+                        result.dataset_name, primary,
+                    )
+            except Exception:
+                st.session_state["gemini_audit_context"] = "Audit context unavailable."
+
+        if "gemini_chat_history" not in st.session_state:
+            st.session_state["gemini_chat_history"] = []
+        if "gemini_chat_display" not in st.session_state:
+            st.session_state["gemini_chat_display"] = []
+
+        # Render chat history
+        for _msg in st.session_state["gemini_chat_display"]:
+            with st.chat_message(_msg["role"], avatar="🧑" if _msg["role"] == "user" else "✨"):
+                st.markdown(_msg["content"])
+
+        _user_input = st.chat_input("Ask Gemini about your audit...", key="gemini_chat_input")
+        if _user_input:
+            # Show user message immediately
+            st.session_state["gemini_chat_display"].append({"role": "user", "content": _user_input})
+            with st.chat_message("user", avatar="🧑"):
+                st.markdown(_user_input)
+
+            with st.chat_message("assistant", avatar="✨"):
+                with st.spinner("Gemini is thinking..."):
+                    from src.narrative.llm_narrator import ask_remediation_chat
+                    _reply = ask_remediation_chat(
+                        user_message=_user_input,
+                        audit_context=st.session_state.get("gemini_audit_context", ""),
+                        chat_history=st.session_state["gemini_chat_history"],
+                        api_key=_chat_key,
+                    )
+                st.markdown(_reply)
+
+            # Append to Gemini history format for multi-turn context
+            st.session_state["gemini_chat_history"].append(
+                {"role": "user",  "parts": [_user_input]}
+            )
+            st.session_state["gemini_chat_history"].append(
+                {"role": "model", "parts": [_reply]}
+            )
+            st.session_state["gemini_chat_display"].append(
+                {"role": "assistant", "content": _reply}
+            )
+
+        if st.session_state["gemini_chat_display"]:
+            if st.button("🗑 Clear chat", key="clear_gemini_chat"):
+                st.session_state["gemini_chat_history"] = []
+                st.session_state["gemini_chat_display"] = []
+                st.session_state.pop("gemini_audit_context", None)
+                st.rerun()
+    else:
+        hint("Add your <b>Gemini API key</b> in the sidebar to chat with the AI fairness advisor.")
