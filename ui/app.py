@@ -2545,15 +2545,19 @@ with tab7:
             _sc_score = sc.get("overall_risk_score", 0)
             _sc_legal = sc.get("legal_exposure", "Unknown")
 
+            _sc_risk_color = _risk_colors.get(_sc_risk, "#fff")
+            _sc_legal_color = _risk_colors.get(_sc_legal, "#fff")
+            _sc_rec_color = _rec_colors.get(_sc_rec, "#fff")
+
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                st.markdown(f"<div style='text-align:center'><span style='font-size:2rem;font-weight:700;color:{_risk_colors.get(_sc_risk,\"#fff\")}'>{_sc_risk}</span><br><span style='color:#8b949e;font-size:0.75rem'>RISK LEVEL</span></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:center'><span style='font-size:2rem;font-weight:700;color:{_sc_risk_color}'>{_sc_risk}</span><br><span style='color:#8b949e;font-size:0.75rem'>RISK LEVEL</span></div>", unsafe_allow_html=True)
             with c2:
                 st.markdown(f"<div style='text-align:center'><span style='font-size:2rem;font-weight:700'>{_sc_score}</span><span style='color:#8b949e'>/100</span><br><span style='color:#8b949e;font-size:0.75rem'>RISK SCORE</span></div>", unsafe_allow_html=True)
             with c3:
-                st.markdown(f"<div style='text-align:center'><span style='font-size:1.1rem;font-weight:700;color:{_risk_colors.get(_sc_legal,\"#fff\")}'>{_sc_legal}</span><br><span style='color:#8b949e;font-size:0.75rem'>LEGAL EXPOSURE</span></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:center'><span style='font-size:1.1rem;font-weight:700;color:{_sc_legal_color}'>{_sc_legal}</span><br><span style='color:#8b949e;font-size:0.75rem'>LEGAL EXPOSURE</span></div>", unsafe_allow_html=True)
             with c4:
-                st.markdown(f"<div style='text-align:center'><span style='font-size:0.85rem;font-weight:700;color:{_rec_colors.get(_sc_rec,\"#fff\")}'>{_sc_rec}</span><br><span style='color:#8b949e;font-size:0.75rem'>RECOMMENDATION</span></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:center'><span style='font-size:0.85rem;font-weight:700;color:{_sc_rec_color}'>{_sc_rec}</span><br><span style='color:#8b949e;font-size:0.75rem'>RECOMMENDATION</span></div>", unsafe_allow_html=True)
 
             if sc.get("dimensions"):
                 st.markdown("**Dimension Breakdown**")
