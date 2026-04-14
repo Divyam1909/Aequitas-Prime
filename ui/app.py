@@ -1425,7 +1425,8 @@ with tab3:
         "with fairness-aware sample weighting — compatible with any sklearn-API model."
     )
     if result.reweigh_result is not None and result._df_clean is not None:
-        df_out = result._df_clean.copy()
+        train_idx = result.baseline_train.X_train.index
+        df_out = result._df_clean.loc[train_idx].copy()
         df_out["sample_weight"] = result.reweigh_result.weights
         csv_bytes = df_out.to_csv(index=False).encode("utf-8")
         st.download_button(
@@ -1436,7 +1437,7 @@ with tab3:
             use_container_width=True,
             help="Dataset with sample_weight column. Use it to train fairness-aware models externally.",
         )
-        st.caption(f"{len(result._df_clean):,} rows × {len(result._df_clean.columns)+1} columns (original + sample_weight). "
+        st.caption(f"{len(df_out):,} rows (training split) × {len(df_out.columns)} columns (original + sample_weight). "
                    "Protected attributes retained for auditability.")
     else:
         st.info("Run mitigation above to generate the debiased dataset.")
