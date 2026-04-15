@@ -96,6 +96,16 @@ def preprocess_generic(
     """
     df = df.copy()
 
+    # ── 0. Neutralize Arrow-backed dtypes ─────────────────────────────────────
+    # Streamlit / pyarrow-enabled pandas may read CSV columns as Arrow-backed
+    # StringDtype. Those columns refuse numeric assignment later ("could not
+    # convert string to float: 'Private'"), so coerce them to plain numpy
+    # dtypes up-front.
+    for col in df.columns:
+        dtype_str = str(df[col].dtype).lower()
+        if "string" in dtype_str or "arrow" in dtype_str or dtype_str == "string[pyarrow]":
+            df[col] = df[col].astype(object)
+
     # ── 1. Drop rows with missing values in key columns ───────────────────────
     key_cols = [config.target_col] + [
         a for a in config.protected_attrs if a in df.columns
@@ -136,12 +146,16 @@ def preprocess_generic(
         if not pd.api.types.is_numeric_dtype(df[c]) and c != config.target_col
     ]
     if cat_cols:
-        # Cast to plain object dtype (not Arrow StringDtype) so OrdinalEncoder's
-        # float output can be assigned back without a string-cast error.
+        # Cast to plain object dtype (not Arrow StringDtype) so OrdinalEncoder
+        # can read the values, then DROP the string columns and re-insert the
+        # float results. Assigning into existing string-typed columns would make
+        # pandas try to coerce floats back to strings and fail.
         cat_df = df[cat_cols].astype(str).astype(object)
         enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
         encoded = enc.fit_transform(cat_df)
-        df[cat_cols] = pd.DataFrame(encoded, index=df.index, columns=cat_cols)
+        df = df.drop(columns=cat_cols)
+        for i, col in enumerate(cat_cols):
+            df[col] = encoded[:, i].astype(float)
 
     # ── 7. Build feature matrix X and target y ────────────────────────────────
     feature_cols = [c for c in df.columns if c != config.target_col]
