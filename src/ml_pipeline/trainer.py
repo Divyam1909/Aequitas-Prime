@@ -53,7 +53,6 @@ def _build_lr(multiclass: bool = False) -> LogisticRegression:
         max_iter=1000, random_state=42,
         class_weight=None if multiclass else "balanced",
         solver="lbfgs",
-        multi_class="auto",
     )
 
 
@@ -63,7 +62,6 @@ def _build_xgb(multiclass: bool = False) -> Any:
         return XGBClassifier(
             n_estimators=100, random_state=42,
             eval_metric="logloss", verbosity=0,
-            use_label_encoder=False,
         )
     except ImportError:
         from sklearn.ensemble import GradientBoostingClassifier
