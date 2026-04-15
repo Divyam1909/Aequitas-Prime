@@ -1089,8 +1089,7 @@ with tab1:
             "Protected Attr":    r.protected_attr,
             "Combined Score":    round(getattr(r, "combined_score", r.mutual_info), 4),
             "Mutual Info":       round(r.mutual_info, 4),
-            "Cramér V":          round(getattr(r, "cramers_v", float("nan")), 4)
-                                 if not np.isnan(getattr(r, "cramers_v", float("nan"))) else "—",
+            "Cramér V":          (lambda v: round(v, 4) if isinstance(v, (int, float)) and not np.isnan(v) else "—")(getattr(r, "cramers_v", float("nan"))),
             "Risk Level":        r.risk_level,
             "Recommended Action": r.action,
         } for r in flagged])
