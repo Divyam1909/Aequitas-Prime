@@ -22,9 +22,34 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
+from scipy.stats import chi2_contingency
 
 from src.utils.schema import DatasetConfig
 from src.bias_engine.proxy_scanner import ProxyResult
+
+
+# ── Dynamic effect-size helper ───────────────────────────────────────────────
+
+def _cramers_v(x: pd.Series, y: pd.Series) -> float:
+    """
+    Cramér's V — sample-size-independent effect size for categorical
+    association. Returns a value in [0, 1]. Used to weight signals by how
+    statistically strong the underlying association is, *computed from the
+    actual data* (no hardcoded thresholds).
+    """
+    try:
+        contingency = pd.crosstab(x, y)
+        if contingency.size == 0 or contingency.shape[0] < 2 or contingency.shape[1] < 2:
+            return 0.0
+        chi2, _, _, _ = chi2_contingency(contingency, correction=False)
+        n = contingency.values.sum()
+        min_dim = min(contingency.shape) - 1
+        if n <= 0 or min_dim <= 0:
+            return 0.0
+        v = np.sqrt(chi2 / (n * min_dim))
+        return float(np.clip(v, 0.0, 1.0))
+    except Exception:
+        return 0.0
 
 
 @dataclass
@@ -206,8 +231,13 @@ def _label_score(
     else:
         label_ratio = 1.0
 
-    # log2(ratio) / log2(100) maps ratio=1 → 0, ratio=100 → 1
-    score = float(np.clip(np.log2(max(label_ratio, 1.0)) / np.log2(100.0), 0.0, 1.0))
+    # log2(ratio) / log2(10) maps ratio=1 → 0, ratio=10 → 1.
+    # 10× positive-rate ratio reflects well-established fairness norms (EEOC
+    # 4/5ths rule flags 1.25×; Cohen's "large effect" for rate ratios ≈ 4×;
+    # 10× = extreme/textbook historical discrimination). This ceiling is
+    # universal across datasets — it reflects human-decision severity, not
+    # dataset-specific properties.
+    score = float(np.clip(np.log2(max(label_ratio, 1.0)) / np.log2(10.0), 0.0, 1.0))
 
     higher_group = "privileged" if priv_rate >= unpriv_rate else "unprivileged"
     if label_ratio >= 1.5:
@@ -223,6 +253,99 @@ def _label_score(
             "Label bias is unlikely as the primary cause."
         )
     return score, msg
+
+
+def _compute_dynamic_weights(
+    df_clean: pd.DataFrame,
+    config: DatasetConfig,
+    proxy_scan_results: dict[str, list[ProxyResult]],
+    attr: str,
+) -> dict[str, float]:
+    """
+    Compute data-driven amplification weights for each bias source using
+    statistical effect sizes measured from the actual dataset. Works for any
+    dataset because all weights are derived from the data — no hardcoded
+    column names or domain-specific constants.
+
+      label_weight  = Cramér's V(protected_attr, target)
+                      → strong association ⇒ label bias signal is trustworthy
+      feat_weight   = max proxy combined_score (already data-driven)
+      rep_weight    = Cramér's V(protected_attr, protected_attr) surrogate —
+                      uses entropy deficit vs uniform (data-driven)
+    """
+    weights = {"label_bias": 0.0, "representation_bias": 0.0, "feature_bias": 0.0}
+
+    if attr in df_clean.columns and config.target_col in df_clean.columns:
+        weights["label_bias"] = _cramers_v(df_clean[attr], df_clean[config.target_col])
+
+    if attr in df_clean.columns:
+        counts = df_clean[attr].value_counts()
+        if len(counts) >= 2:
+            probs = (counts / counts.sum()).values
+            entropy = -np.sum(probs * np.log2(probs + 1e-12))
+            max_entropy = np.log2(len(counts))
+            weights["representation_bias"] = float(
+                np.clip(1.0 - (entropy / max_entropy) if max_entropy > 0 else 0.0, 0.0, 1.0)
+            )
+
+    all_proxies = [r for results in proxy_scan_results.values() for r in results]
+    if all_proxies:
+        weights["feature_bias"] = float(
+            np.clip(max(r.combined_score for r in all_proxies), 0.0, 1.0)
+        )
+
+    return weights
+
+
+def _bootstrap_vote_share(
+    df_clean: pd.DataFrame,
+    config: DatasetConfig,
+    proxy_scan_results: dict[str, list[ProxyResult]],
+    attr: str,
+    dynamic_weights: dict[str, float],
+    imbalance_ratio_threshold: float,
+    high_proxy_threshold: float,
+    n_iterations: int = 40,
+    seed: int = 42,
+) -> dict[str, float]:
+    """
+    Empirical confidence via bootstrap resampling.
+
+    Resample the dataset with replacement n_iterations times; for each sample,
+    recompute label and representation scores (feature score is fixed per run
+    since re-running the proxy scan is O(n × p) and expensive). Apply the same
+    dynamic weights and record which source wins. Vote share = empirical
+    probability that the primary-source diagnosis is stable under perturbation.
+
+    Dataset-agnostic: operates purely on the cleaned dataframe.
+    """
+    rng = np.random.default_rng(seed)
+    votes = {"label_bias": 0, "representation_bias": 0, "feature_bias": 0}
+
+    # Feature score held fixed — proxy scan is already data-driven and stable.
+    feat_score, _ = _feature_score(proxy_scan_results, high_proxy_threshold)
+
+    n_rows = len(df_clean)
+    if n_rows < 20:
+        # Too small to bootstrap reliably — return uniform distribution.
+        return {k: 1.0 / 3.0 for k in votes}
+
+    for _ in range(n_iterations):
+        idx = rng.integers(0, n_rows, size=n_rows)
+        sample = df_clean.iloc[idx]
+
+        rep_s, _ = _representation_score(sample, attr, imbalance_ratio_threshold)
+        lab_s, _ = _label_score(sample, config, attr)
+
+        adj = {
+            "label_bias":          lab_s  * (0.5 + 0.5 * dynamic_weights["label_bias"]),
+            "representation_bias": rep_s  * (0.5 + 0.5 * dynamic_weights["representation_bias"]),
+            "feature_bias":        feat_score * (0.5 + 0.5 * dynamic_weights["feature_bias"]),
+        }
+        winner = max(adj, key=adj.get)
+        votes[winner] += 1
+
+    return {k: v / n_iterations for k, v in votes.items()}
 
 
 def trace_bias_provenance(
@@ -263,24 +386,57 @@ def trace_bias_provenance(
     label_score, label_msg = _label_score(df_clean, config, attr)
     evidence.append(label_msg)
 
-    scores = {
+    raw_scores = {
         "label_bias":          label_score,
         "representation_bias": rep_score,
         "feature_bias":        feat_score,
     }
 
-    # ── Pick primary and secondary ─────────────────────────────────────────────
-    sorted_scores = sorted(scores.items(), key=lambda t: t[1], reverse=True)
+    # ── Dynamic effect-size weighting (data-driven, any dataset) ──────────────
+    # Each signal is amplified by its own statistical effect size computed from
+    # the actual data (Cramér's V, entropy deficit, max proxy score). A signal
+    # backed by a strong association in the data gets up-weighted; a weak or
+    # spurious signal gets damped. No hardcoded thresholds.
+    dynamic_weights = _compute_dynamic_weights(df_clean, config, proxy_scan_results, attr)
+
+    adjusted_scores = {
+        k: raw_scores[k] * (0.5 + 0.5 * dynamic_weights[k])
+        for k in raw_scores
+    }
+
+    # ── Pick primary and secondary from adjusted scores ───────────────────────
+    sorted_scores = sorted(adjusted_scores.items(), key=lambda t: t[1], reverse=True)
     primary   = sorted_scores[0][0]
     secondary = sorted_scores[1][0] if sorted_scores[1][1] > 0.05 else None
 
-    # Confidence = margin between top-1 and top-2, scaled up to 1.0
-    top_score  = sorted_scores[0][1]
-    runner_up  = sorted_scores[1][1]
-    margin     = top_score - runner_up  # ∈ [0, 1]
+    # ── Bootstrap empirical confidence ────────────────────────────────────────
+    # Resample the cleaned data N times and recompute scores each time. The
+    # fraction of resamples in which `primary` still wins IS the empirical
+    # probability that our diagnosis is stable — the definition of confidence.
+    # This is fully data-driven and works for any dataset.
+    vote_share = _bootstrap_vote_share(
+        df_clean, config, proxy_scan_results, attr, dynamic_weights,
+        imbalance_ratio_threshold, high_proxy_threshold,
+    )
 
-    # Also factor in absolute magnitude: a score of 0.05 vs 0.01 is low confidence
-    confidence = float(np.clip(0.4 * top_score + 0.6 * margin, 0.0, 1.0))
+    # Blend bootstrap vote share (empirical truth) with softmax dominance of
+    # adjusted scores (signal clarity) for a smooth, well-calibrated estimate.
+    top_score = sorted_scores[0][1]
+    scores_arr = np.array([s for _, s in sorted_scores], dtype=float)
+
+    if top_score < 0.02 and max(vote_share.values()) < 0.5:
+        confidence = 0.0
+    else:
+        temperature = 0.15
+        exp_scores = np.exp(scores_arr / temperature)
+        probs = exp_scores / exp_scores.sum()
+        softmax_confidence = float(probs.max())
+        bootstrap_confidence = float(vote_share.get(primary, 0.0))
+        # 70% weight on empirical bootstrap, 30% on softmax clarity
+        combined = 0.7 * bootstrap_confidence + 0.3 * softmax_confidence
+        # Mild magnitude floor: if top adjusted score is very weak, cap at 0.5
+        magnitude_factor = float(np.clip(top_score / 0.10, 0.5, 1.0))
+        confidence = float(np.clip(combined * magnitude_factor, 0.0, 1.0))
 
     # ── Fixes and cautions ────────────────────────────────────────────────────
     fix_map = {
@@ -301,6 +457,14 @@ def trace_bias_provenance(
             "Shadow proxy features remain even after removing the protected attribute. "
             "Feature mitigation (DIR or proxy removal) should complement sample-weight methods."
         )
+
+    # Expose raw, adjusted, and bootstrap signals for transparency in the UI.
+    scores = {
+        **raw_scores,
+        **{f"{k}_adjusted": v for k, v in adjusted_scores.items()},
+        **{f"{k}_weight": v for k, v in dynamic_weights.items()},
+        **{f"{k}_vote_share": v for k, v in vote_share.items()},
+    }
 
     return ProvenanceReport(
         primary_source=primary,

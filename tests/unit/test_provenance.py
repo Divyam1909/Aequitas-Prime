@@ -23,6 +23,7 @@ def _make_proxy_result(mi: float) -> ProxyResult:
         point_biserial_r=None,
         risk_level="HIGH" if mi >= 0.15 else "LOW",
         action="",
+        combined_score=mi,
     )
 
 
