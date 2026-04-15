@@ -136,10 +136,12 @@ def preprocess_generic(
         if not pd.api.types.is_numeric_dtype(df[c]) and c != config.target_col
     ]
     if cat_cols:
-        # Cast to plain Python str first so OrdinalEncoder handles any dtype
-        df[cat_cols] = df[cat_cols].astype(str)
+        # Cast to plain object dtype (not Arrow StringDtype) so OrdinalEncoder's
+        # float output can be assigned back without a string-cast error.
+        cat_df = df[cat_cols].astype(str).astype(object)
         enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-        df[cat_cols] = enc.fit_transform(df[cat_cols])
+        encoded = enc.fit_transform(cat_df)
+        df[cat_cols] = pd.DataFrame(encoded, index=df.index, columns=cat_cols)
 
     # ── 7. Build feature matrix X and target y ────────────────────────────────
     feature_cols = [c for c in df.columns if c != config.target_col]
