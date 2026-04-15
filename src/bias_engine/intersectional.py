@@ -230,7 +230,11 @@ def get_heatmap_data(
     """
     records = []
     for r in results:
-        if row_attr in r.group_attrs and col_attr in r.group_attrs:
+        if (
+            row_attr in r.group_attrs
+            and col_attr in r.group_attrs
+            and len(r.group_attrs) == 2
+        ):
             records.append({
                 "row_val": r.group_attrs[row_attr],
                 "col_val": r.group_attrs[col_attr],
@@ -239,4 +243,9 @@ def get_heatmap_data(
     if not records:
         return pd.DataFrame()
     df = pd.DataFrame(records)
-    return df.pivot(index="row_val", columns="col_val", values="value")
+    return df.pivot_table(
+        index="row_val",
+        columns="col_val",
+        values="value",
+        aggfunc="mean",
+    )
