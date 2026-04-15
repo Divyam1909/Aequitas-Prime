@@ -177,6 +177,58 @@ def _sobel_p(alpha: float, gamma: float, se_alpha: float, se_gamma: float) -> tu
 
 # ── Single mediation path ─────────────────────────────────────────────────────
 
+def _encode_col(
+    series: pd.Series,
+    attr: str,
+    config: DatasetConfig,
+    is_protected: bool = False,
+) -> pd.Series:
+    """
+    Encode a single column to numeric for OLS regression.
+
+    - For protected attributes: privileged=1, unprivileged=0 (binary).
+    - For other string/categorical columns: ordinal integer encoding.
+    - For already-numeric columns: pass through (coerce on error).
+    """
+    s = series.copy()
+
+    # Already numeric → coerce safely
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+
+    # Arrow-backed or other extension types → convert first
+    try:
+        s = s.astype(str)
+    except Exception:
+        return pd.to_numeric(series, errors="coerce")
+
+    if is_protected:
+        priv_val = config.privileged_values.get(attr)
+        if priv_val is not None:
+            return (s == str(priv_val)).astype(float)
+        # No privileged value known: ordinal encode
+    # Ordinal encode: assign integer rank by sorted unique values
+    cats = sorted(s.dropna().unique())
+    mapping = {v: i for i, v in enumerate(cats)}
+    return s.map(mapping).astype(float)
+
+
+def _to_numpy_float(series: pd.Series) -> np.ndarray:
+    """
+    Robustly convert a pandas Series to a plain float64 numpy array.
+    Handles Arrow-backed, extension, and object dtypes.
+    """
+    try:
+        # Fast path: already float64
+        return series.to_numpy(dtype=float, na_value=np.nan)
+    except Exception:
+        pass
+    try:
+        return np.array(series.tolist(), dtype=float)
+    except Exception:
+        return np.full(len(series), np.nan, dtype=float)
+
+
 def _mediation_path(
     df: pd.DataFrame,
     config: DatasetConfig,
@@ -191,9 +243,19 @@ def _mediation_path(
 
     # Numeric-only slice
     cols_needed = [attr, mediator, target] + (confounders or [])
+    # Work on a plain copy to avoid Arrow-backed dtype assignment issues
     sub = df[cols_needed].copy()
+    # Force convert to object dtype first so float assignments always succeed
+    sub = sub.astype(object)
+
+    # Encode each column to numeric — handles string/categorical attrs
+    protected_set = set(config.protected_attrs)
     for c in cols_needed:
-        sub[c] = pd.to_numeric(sub[c], errors="coerce")
+        if c in sub.columns:
+            is_prot = c in protected_set
+            encoded = _encode_col(df[c], c, config, is_protected=is_prot)
+            sub[c] = _to_numpy_float(encoded)
+
     sub = sub.dropna()
     n = len(sub)
 
@@ -206,38 +268,70 @@ def _mediation_path(
             interpretation=f"Insufficient data (n={n}) for mediation analysis.",
         )
 
-    A = sub[attr].values
-    M = sub[mediator].values
-    Y = sub[target].values
-    C = sub[confounders].values if confounders else np.empty((n, 0))
+    A = sub[attr].to_numpy(dtype=float)
+    M = sub[mediator].to_numpy(dtype=float)
+    Y = sub[target].to_numpy(dtype=float)
+    C = sub[confounders].to_numpy(dtype=float) if confounders else np.empty((n, 0))
 
-    # ── Step 1: Y ~ A (+ C)  →  total effect ──────────────────────────────────
-    X1 = _add_const(np.column_stack([A, C]) if C.shape[1] > 0 else A.reshape(-1, 1))
-    beta1, se1 = _ols_coef(X1, Y)
-    beta_total = float(beta1[1])   # coefficient on A (index 0 = intercept)
-    se_total   = float(se1[1])
+    # Guard: if A is near-constant (no variance), OLS is meaningless
+    if np.nanstd(A) < 1e-9:
+        return MediationPathResult(
+            protected_attr=attr, mediator=mediator,
+            total_effect=float("nan"), direct_effect=float("nan"),
+            indirect_effect=float("nan"), sobel_z=float("nan"), sobel_p=float("nan"),
+            percent_mediated=float("nan"), n_samples=n,
+            interpretation=(
+                f"Protected attribute '{attr}' has near-zero variance in the data — "
+                "cannot estimate causal effects. Check encoding and privileged_value configuration."
+            ),
+        )
+    # Guard: if M is near-constant, indirect path is trivially zero
+    if np.nanstd(M) < 1e-9:
+        return MediationPathResult(
+            protected_attr=attr, mediator=mediator,
+            total_effect=float("nan"), direct_effect=float("nan"),
+            indirect_effect=0.0, sobel_z=float("nan"), sobel_p=float("nan"),
+            percent_mediated=float("nan"), n_samples=n,
+            interpretation=f"Mediator '{mediator}' has near-zero variance — no indirect path possible.",
+        )
 
-    # ── Step 2: M ~ A (+ C)  →  α path ───────────────────────────────────────
-    X2 = _add_const(np.column_stack([A, C]) if C.shape[1] > 0 else A.reshape(-1, 1))
-    beta2, se2 = _ols_coef(X2, M)
-    alpha    = float(beta2[1])
-    se_alpha = float(se2[1])
+    try:
+        # ── Step 1: Y ~ A (+ C)  →  total effect ─────────────────────────────
+        X1 = _add_const(np.column_stack([A, C]) if C.shape[1] > 0 else A.reshape(-1, 1))
+        beta1, se1 = _ols_coef(X1, Y)
+        beta_total = float(beta1[1])
+        se_total   = float(se1[1])  # noqa: F841
 
-    # ── Step 3: Y ~ A + M (+ C)  →  direct effect + γ ────────────────────────
-    AM = np.column_stack([A, M])
-    if C.shape[1] > 0:
-        AM = np.column_stack([AM, C])
-    X3 = _add_const(AM)
-    beta3, se3 = _ols_coef(X3, Y)
-    beta_direct = float(beta3[1])   # A coefficient (with M in model)
-    gamma       = float(beta3[2])   # M coefficient
-    se_gamma    = float(se3[2])
+        # ── Step 2: M ~ A (+ C)  →  α path ──────────────────────────────────
+        X2 = _add_const(np.column_stack([A, C]) if C.shape[1] > 0 else A.reshape(-1, 1))
+        beta2, se2 = _ols_coef(X2, M)
+        alpha    = float(beta2[1])
+        se_alpha = float(se2[1])
 
-    # ── Step 4: Indirect effect ───────────────────────────────────────────────
-    indirect = alpha * gamma
-    z, p     = _sobel_p(alpha, gamma, se_alpha, se_gamma)
+        # ── Step 3: Y ~ A + M (+ C)  →  direct effect + γ ───────────────────
+        AM = np.column_stack([A, M])
+        if C.shape[1] > 0:
+            AM = np.column_stack([AM, C])
+        X3 = _add_const(AM)
+        beta3, se3 = _ols_coef(X3, Y)
+        beta_direct = float(beta3[1])
+        gamma       = float(beta3[2])
+        se_gamma    = float(se3[2])
 
-    pct = (indirect / beta_total * 100) if abs(beta_total) > 1e-9 else float("nan")
+        # ── Step 4: Indirect effect ───────────────────────────────────────────
+        indirect = alpha * gamma
+        z, p     = _sobel_p(alpha, gamma, se_alpha, se_gamma)
+
+        pct = (indirect / beta_total * 100) if abs(beta_total) > 1e-9 else float("nan")
+
+    except Exception as _exc:
+        return MediationPathResult(
+            protected_attr=attr, mediator=mediator,
+            total_effect=float("nan"), direct_effect=float("nan"),
+            indirect_effect=float("nan"), sobel_z=float("nan"), sobel_p=float("nan"),
+            percent_mediated=float("nan"), n_samples=n,
+            interpretation=f"OLS computation failed for mediator '{mediator}': {_exc}",
+        )
 
     # ── Interpretation ────────────────────────────────────────────────────────
     direction = "positive" if beta_total > 0 else "negative"

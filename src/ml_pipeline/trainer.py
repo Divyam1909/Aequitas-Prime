@@ -254,6 +254,28 @@ def train_preprocessed(
     )
 
 
+def _build_mitigation_model(base_model: str, task: str):
+    """
+    Build a model for the pre-processed (reweighed) training step.
+
+    Key differences from the baseline builders:
+    - No class_weight="balanced" — AIF360 sample_weight already encodes class
+      balance information; combining both causes double-weighting that reduces
+      the reweighing effect and leaves DI unchanged.
+    - Fewer estimators (RF: 50 instead of 100) for faster Surgeon-tab runs.
+    """
+    if task == "regression":
+        return MODEL_REGISTRY_REG.get(base_model, MODEL_REGISTRY_REG["rf"])()
+    if base_model == "rf":
+        return RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+    if base_model == "lr":
+        return LogisticRegression(max_iter=500, random_state=42, solver="lbfgs")
+    if base_model == "xgb":
+        return _build_xgb()
+    # stack and unknown: fall back to LR (fastest + most weight-sensitive)
+    return LogisticRegression(max_iter=500, random_state=42, solver="lbfgs")
+
+
 def train_preprocessed_presplit(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -279,7 +301,8 @@ def train_preprocessed_presplit(
     if base_model not in MODEL_REGISTRY:
         raise ValueError(f"Unknown base_model '{base_model}'.")
 
-    clf = MODEL_REGISTRY[base_model]() if task != "regression" else MODEL_REGISTRY_REG[base_model]()
+    # Use a weight-sensitive model without conflicting class_weight setting
+    clf = _build_mitigation_model(base_model, task)
     try:
         clf.fit(X_train, y_train, sample_weight=weights_train)
     except TypeError:

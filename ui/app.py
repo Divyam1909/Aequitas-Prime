@@ -456,46 +456,183 @@ def build_config_ui(df: pd.DataFrame, is_demo: bool = False):
 
 def make_shareable_link(result) -> tuple[str, bytes]:
     """
-    Encode key audit metrics into a base64 URL param and generate an SVG badge.
+    Encode audit metrics into a base64 URL param and generate a certificate-style SVG badge.
     Returns (encoded_string, svg_bytes).
     """
     primary = result.config.primary_protected_attr()
     bm = result.baseline_eval.fairness.get(primary) if result.baseline_eval else None
+
+    # Collect all-attr DI values for the certificate
+    all_dis = {}
+    if result.baseline_eval:
+        for _a, _m in result.baseline_eval.fairness.items():
+            if not np.isnan(_m.disparate_impact):
+                all_dis[_a] = round(_m.disparate_impact, 3)
+
+    mitigation_done = result.preprocessed_eval is not None
+    pm = result.preprocessed_eval.fairness.get(primary) if result.preprocessed_eval else None
+
     payload = {
-        "dataset":   result.dataset_name,
-        "n_rows":    result.n_rows,
-        "attr":      primary,
-        "di":        round(bm.disparate_impact, 3) if bm and not np.isnan(bm.disparate_impact) else None,
-        "severity":  bm.severity if bm else "UNKNOWN",
-        "ts":        pd.Timestamp.now().isoformat()[:10],
+        "dataset":       result.dataset_name,
+        "n_rows":        result.n_rows,
+        "n_features":    result.n_features,
+        "attr":          primary,
+        "di":            round(bm.disparate_impact, 3) if bm and not np.isnan(bm.disparate_impact) else None,
+        "di_after":      round(pm.disparate_impact, 3) if pm and not np.isnan(pm.disparate_impact) else None,
+        "severity":      bm.severity if bm else "UNKNOWN",
+        "all_dis":       all_dis,
+        "mitigated":     mitigation_done,
+        "ts":            pd.Timestamp.now().isoformat()[:10],
     }
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
     severity  = payload["severity"]
     di_val    = payload["di"]
     sev_color = {"CRITICAL": "#dc2626", "WARNING": "#d97706", "CLEAR": "#16a34a"}.get(severity, "#6b7280")
+    sev_icon  = {"CRITICAL": "✗", "WARNING": "!", "CLEAR": "✓"}.get(severity, "?")
     di_text   = f"DI={di_val:.2f}" if di_val is not None else "DI=N/A"
+    date_str  = payload["ts"]
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="240" height="20" role="img">
-  <title>Aequitas Prime Fairness Audit</title>
-  <linearGradient id="s" x2="0" y2="100%">
-    <stop offset="0"  stop-color="#bbb" stop-opacity=".1"/>
-    <stop offset="1"  stop-opacity=".1"/>
-  </linearGradient>
-  <clipPath id="r"><rect width="240" height="20" rx="3" fill="#fff"/></clipPath>
-  <g clip-path="url(#r)">
-    <rect width="130" height="20" fill="#555"/>
-    <rect x="130" width="110" height="20" fill="{sev_color}"/>
-    <rect width="240" height="20" fill="url(#s)"/>
+    # Certificate-style SVG badge (320×28) with dataset name, DI, severity
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="28" role="img" aria-label="Aequitas Prime Fairness Audit">
+  <title>Aequitas Prime Fairness Audit — {dataset_name_short(result.dataset_name)} — {severity}</title>
+  <defs>
+    <linearGradient id="grad_label" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1f2937"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="grad_sev" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="{sev_color}" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="{sev_color}" stop-opacity="0.80"/>
+    </linearGradient>
+  </defs>
+  <clipPath id="clip_all"><rect width="320" height="28" rx="4" fill="#fff"/></clipPath>
+  <g clip-path="url(#clip_all)">
+    <rect width="320" height="28" fill="url(#grad_label)"/>
+    <rect x="20" y="0" width="2" height="28" fill="#7c3aed"/>
+    <rect x="220" width="100" height="28" fill="url(#grad_sev)"/>
   </g>
-  <g fill="#fff" text-anchor="middle" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11">
-    <text x="65"  y="15" fill="#010101" fill-opacity=".3">Aequitas Audit | {di_text}</text>
-    <text x="65"  y="14">Aequitas Audit | {di_text}</text>
-    <text x="185" y="15" fill="#010101" fill-opacity=".3">{severity}</text>
-    <text x="185" y="14">{severity}</text>
+  <g font-family="'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="10.5" fill="#e5e7eb">
+    <text x="30" y="11" font-size="8" fill="#9ca3af" letter-spacing="1">AEQUITAS PRIME</text>
+    <text x="30" y="23" font-weight="600" fill="#f9fafb">Fairness Audit · {di_text} · {date_str}</text>
+  </g>
+  <g font-family="'Segoe UI',Roboto,Helvetica,Arial,sans-serif" text-anchor="middle">
+    <text x="270" y="12" font-size="9" fill="#ffffff" fill-opacity="0.75" letter-spacing="0.5">VERDICT</text>
+    <text x="270" y="24" font-size="11" font-weight="700" fill="#ffffff">{sev_icon} {severity}</text>
   </g>
 </svg>"""
     return encoded, svg.encode("utf-8")
+
+
+def dataset_name_short(name: str, max_len: int = 20) -> str:
+    """Truncate dataset name for badge display."""
+    return name[:max_len] + "…" if len(name) > max_len else name
+
+
+def render_audit_certificate(payload: dict) -> None:
+    """
+    Render a standalone audit certificate page from a decoded shareable URL payload.
+    Called when the app loads with ?audit=... in the URL.
+    """
+    severity   = payload.get("severity", "UNKNOWN")
+    sev_color  = {"CRITICAL": "#dc2626", "WARNING": "#d97706", "CLEAR": "#16a34a"}.get(severity, "#6b7280")
+    di_val     = payload.get("di")
+    di_after   = payload.get("di_after")
+    dataset    = payload.get("dataset", "Unknown")
+    n_rows     = payload.get("n_rows", 0)
+    n_features = payload.get("n_features", 0)
+    attr       = payload.get("attr", "—")
+    ts         = payload.get("ts", "—")
+    mitigated  = payload.get("mitigated", False)
+    all_dis    = payload.get("all_dis", {})
+
+    st.markdown(f"""
+    <div style="max-width:680px;margin:2rem auto;background:#161b22;border-radius:16px;
+                border:1px solid #30363d;overflow:hidden;box-shadow:0 8px 32px #0005;">
+      <!-- Header bar -->
+      <div style="background:#0d1117;padding:1.2rem 1.8rem;border-bottom:1px solid #30363d;
+                  display:flex;align-items:center;gap:1rem;">
+        <div style="font-size:1.8rem">⚖️</div>
+        <div>
+          <div style="font-size:0.72rem;color:#8b949e;letter-spacing:2px;text-transform:uppercase">
+            Aequitas Prime · Fairness Audit Certificate
+          </div>
+          <div style="font-size:1.2rem;font-weight:700;color:#e6edf3;margin-top:2px">{dataset}</div>
+        </div>
+        <div style="margin-left:auto;background:{sev_color};color:#fff;
+                    padding:0.4rem 1.2rem;border-radius:20px;font-weight:700;font-size:0.95rem;">
+          {severity}
+        </div>
+      </div>
+      <!-- Metrics grid -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0;border-bottom:1px solid #30363d;">
+        <div style="padding:1rem 1.5rem;border-right:1px solid #30363d">
+          <div style="font-size:0.75rem;color:#8b949e">Dataset Rows</div>
+          <div style="font-size:1.4rem;font-weight:700;color:#e6edf3">{n_rows:,}</div>
+        </div>
+        <div style="padding:1rem 1.5rem;border-right:1px solid #30363d">
+          <div style="font-size:0.75rem;color:#8b949e">Features Audited</div>
+          <div style="font-size:1.4rem;font-weight:700;color:#e6edf3">{n_features}</div>
+        </div>
+        <div style="padding:1rem 1.5rem;">
+          <div style="font-size:0.75rem;color:#8b949e">Audit Date</div>
+          <div style="font-size:1.4rem;font-weight:700;color:#e6edf3">{ts}</div>
+        </div>
+      </div>
+      <!-- DI section -->
+      <div style="padding:1.2rem 1.8rem;border-bottom:1px solid #30363d;">
+        <div style="font-size:0.75rem;color:#8b949e;margin-bottom:0.6rem">
+          DISPARATE IMPACT — Primary Protected Attribute: <b style="color:#c9d1d9">{attr}</b>
+        </div>
+        <div style="display:flex;gap:2rem;align-items:center;">
+          <div>
+            <div style="font-size:0.7rem;color:#8b949e">Baseline DI</div>
+            <div style="font-size:2rem;font-weight:800;color:{sev_color}">
+              {f"{di_val:.3f}" if di_val is not None else "N/A"}
+            </div>
+            <div style="font-size:0.72rem;color:#8b949e">Legal minimum: 0.80</div>
+          </div>
+          {"<div style='font-size:1.5rem;color:#6b7280'>→</div><div><div style='font-size:0.7rem;color:#8b949e'>After Mitigation</div><div style='font-size:2rem;font-weight:800;color:#16a34a'>" + f"{di_after:.3f}" + "</div></div>" if di_after is not None else ""}
+        </div>
+      </div>
+      {"<!-- All-attr DI --><div style='padding:1rem 1.8rem;border-bottom:1px solid #30363d;'><div style='font-size:0.72rem;color:#8b949e;margin-bottom:0.5rem'>ALL PROTECTED ATTRIBUTES</div><div style='display:flex;flex-wrap:wrap;gap:0.5rem;'>" + "".join(f"<span style='background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:0.25rem 0.7rem;font-size:0.82rem;color:#e6edf3'><b>{a}</b> DI={v:.3f} {'✅' if v >= 0.80 else '❌'}</span>" for a, v in all_dis.items()) + "</div></div>" if all_dis else ""}
+      <!-- Footer -->
+      <div style="padding:0.8rem 1.8rem;display:flex;align-items:center;justify-content:space-between;">
+        <div style="font-size:0.72rem;color:#6b7280">
+          Audited with <b style="color:#7c3aed">Aequitas Prime</b> · Google Hackathon 2025
+        </div>
+        <div style="font-size:0.72rem;color:#6b7280">
+          {'✅ Bias Mitigation Applied' if mitigated else '⚠️ Mitigation Not Applied'}
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.caption("This certificate was generated by Aequitas Prime. Share the URL in your browser's address bar.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CERTIFICATE PAGE — detect ?audit=... in URL and show standalone certificate
+# ══════════════════════════════════════════════════════════════════════════════
+_audit_param = st.query_params.get("audit", None)
+if _audit_param:
+    try:
+        _cert_payload = json.loads(base64.urlsafe_b64decode(_audit_param.encode()).decode())
+        st.markdown("""
+        <div style="text-align:center;padding:0.5rem 0 1.5rem;">
+          <span style="font-size:0.75rem;color:#8b949e;letter-spacing:2px;text-transform:uppercase">
+            Aequitas Prime · Fairness Audit Certificate
+          </span>
+        </div>
+        """, unsafe_allow_html=True)
+        render_audit_certificate(_cert_payload)
+        # Show option to open full audit app
+        st.markdown("---")
+        if st.button("🔍 Open Full Audit App", use_container_width=True):
+            st.query_params.clear()
+            st.rerun()
+        st.stop()
+    except Exception as _cert_err:
+        st.warning(f"Could not decode audit certificate: {_cert_err}. Continuing to main app.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1331,18 +1468,54 @@ with tab3:
         st.stop()
 
     result  = st.session_state["pipeline_result"]
-    primary = result.config.primary_protected_attr()
+
+    # ── Attribute selector ────────────────────────────────────────────────────
+    # Default to the most biased attr (lowest DI) so mitigation has the best impact
+    _be = result.baseline_eval
+    _attrs = result.config.protected_attrs
+    if _be and _be.fairness:
+        _default_attr = min(
+            _attrs,
+            key=lambda a: _be.fairness[a].disparate_impact
+                          if (a in _be.fairness and not np.isnan(_be.fairness[a].disparate_impact)) else 1.0
+        )
+    else:
+        _default_attr = result.config.primary_protected_attr()
+
+    _di_hints = []
+    for _a in _attrs:
+        if _be and _a in _be.fairness and not np.isnan(_be.fairness[_a].disparate_impact):
+            _di_hints.append(f"{_a} (DI={_be.fairness[_a].disparate_impact:.3f})")
+        else:
+            _di_hints.append(_a)
+
+    primary = st.selectbox(
+        "Protected attribute to target for mitigation:",
+        options=_attrs,
+        index=_attrs.index(_default_attr),
+        format_func=lambda a: next((h for h in _di_hints if h.startswith(a)), a),
+        key="surgeon_target_attr",
+        help="Choose the attribute most affected by bias. The most biased attribute is pre-selected.",
+    )
+
+    # Detect if the user changed the target — invalidate previous results
+    _prev_target = st.session_state.get("_surgeon_prev_target")
+    if _prev_target != primary:
+        result.preprocessed_eval = None
+        result.inprocessed_eval  = None
+        st.session_state["pipeline_result"] = result
+        st.session_state["_surgeon_prev_target"] = primary
 
     # ── Mitigation trigger ────────────────────────────────────────────────────
     if result.preprocessed_eval is None:
-        st.warning("Mitigation has not been run yet.")
+        st.warning(f"Mitigation for **{primary}** has not been run yet.")
         run_inproc_surgeon = st.session_state.get("_run_inproc", False)
         st.markdown('<div class="glow-btn">', unsafe_allow_html=True)
         run_mit = st.button("⚗️ Run Mitigation Analysis", use_container_width=True,
                             help="Applies Reweighing (pre-processing) and optionally ExponentiatedGradient (in-processing).")
         st.markdown("</div>", unsafe_allow_html=True)
         if run_mit:
-            with st.spinner("Applying bias mitigation techniques..."):
+            with st.spinner(f"Applying bias mitigation for '{primary}'..."):
                 try:
                     from src.ml_pipeline.pipeline import run_mitigation_steps
                     bm_key = st.session_state.get("_base_model", "rf")
@@ -1351,8 +1524,10 @@ with tab3:
                         run_inprocessing=run_inproc_surgeon,
                         base_model=bm_key,
                         verbose=False,
+                        target_attr=primary,
                     )
                     st.session_state["pipeline_result"] = result
+                    st.session_state["_surgeon_prev_target"] = primary
                     st.success("Mitigation complete! Results below.")
                     st.rerun()
                 except Exception as e:
@@ -1371,11 +1546,14 @@ with tab3:
     best_eval = ie if ie else pe
     best_m    = im if im else pm
     acc_delta = best_eval.performance.accuracy - be.performance.accuracy
-    di_delta  = (best_m.disparate_impact - bm.disparate_impact) if (best_m and bm) else 0
+    di_before = bm.disparate_impact if (bm and not np.isnan(bm.disparate_impact)) else None
+    di_after  = best_m.disparate_impact if (best_m and not np.isnan(best_m.disparate_impact)) else None
+    di_delta  = (di_after - di_before) if (di_before is not None and di_after is not None) else None
 
     # ── Headline metrics ───────────────────────────────────────────────────────
     section("Results at a Glance")
     hint(
+        f"Targeting <b>{primary}</b>. "
         "Goal: <b>maximize Disparate Impact</b> (closer to 1.0) while <b>minimising accuracy loss</b>. "
         "A good mitigation improves DI by 0.3+ while losing less than 2% accuracy."
     )
@@ -1383,12 +1561,14 @@ with tab3:
     c1.metric("Accuracy — Baseline",  f"{be.performance.accuracy:.1%}",
               help="Model accuracy before any bias correction. Higher is better.")
     c2.metric("Accuracy — After",     f"{best_eval.performance.accuracy:.1%}",
-              delta=f"{acc_delta:+.1%}",
+              delta=f"{acc_delta:+.1%}" if abs(acc_delta) > 1e-6 else "±0.0%",
+              delta_color="inverse" if acc_delta < -0.001 else "normal",
               help="Accuracy after bias mitigation. A small drop (<2%) is acceptable.")
-    c3.metric("DI — Baseline",        f"{bm.disparate_impact:.3f}" if bm else "—",
-              help="Disparate Impact before mitigation. Below 0.80 = illegal under 4/5ths rule.")
-    c4.metric("DI — After",           f"{best_m.disparate_impact:.3f}" if best_m else "—",
-              delta=f"{di_delta:+.3f}" if di_delta else None,
+    c3.metric(f"DI — Baseline ({primary})",  f"{di_before:.3f}" if di_before is not None else "—",
+              help=f"Disparate Impact for '{primary}' before mitigation. Below 0.80 = illegal under 4/5ths rule.")
+    c4.metric(f"DI — After ({primary})",     f"{di_after:.3f}" if di_after is not None else "—",
+              delta=f"{di_delta:+.3f}" if di_delta is not None else None,
+              delta_color="normal",
               help="Disparate Impact after mitigation. Target: ≥ 0.80 (legal threshold).")
 
     st.divider()
@@ -1789,43 +1969,86 @@ with tab4:
 
     # Radar chart for top worst groups
     top_groups = inter[:min(6, len(inter))]
-    if len(top_groups) >= 3:
+    if len(top_groups) >= 1:
         section("Radar Chart — Top Worst Intersectional Groups")
         hint(
             "Each axis shows a different fairness dimension for the worst-affected demographic combinations. "
-            "A perfectly fair model would fill the entire chart to the outer edge."
+            "A perfectly fair model would fill the entire chart to the outer edge. "
+            "<b>Values are normalised relative to the best group</b> so small absolute numbers still show meaningful differences."
         )
-        radar_cats = ["Disparate Impact", "Approval Rate", "Inverse EOpD"]
+        # ── Radar: Bias Magnitude (outer edge = MOST biased) ──────────────────
+        # Axes show bias severity so the worst groups appear LARGEST.
+        # DI Severity  = 1 - DI             (0 = fair, 1 = fully biased)
+        # EOpD         = |EOpD|             (0 = equal opportunity, 1 = max gap)
+        # Pred Gap     = |priv_pred - grp_pred| / max(priv_pred, 0.01)  (normalized)
+        radar_cats = ["DI Severity", "EOpD Severity", "Pred Rate Gap"]
         fig_radar = go.Figure()
+
+        # Privileged prediction approval rate for normalizing Pred Gap
+        _priv_mask_radar = pd.Series(True, index=df_test.index)
+        for _ra in selected_inter_attrs:
+            from src.bias_engine.detector import _coerce_priv_val
+            _rpv = _coerce_priv_val(df_test[_ra], result.config.privileged_values[_ra])
+            _priv_mask_radar &= (df_test[_ra] == _rpv)
+        _priv_pred_rate = (
+            float((y_pred[_priv_mask_radar.values] == result.config.positive_label).mean())
+            if _priv_mask_radar.any() else 1.0
+        )
+        _priv_pred_rate = max(_priv_pred_rate, 0.01)
+
         for r in top_groups:
-            eopd_inv = max(0.0, 1.0 - abs(r.equal_opportunity_diff)) if not np.isnan(r.equal_opportunity_diff) else 0.5
-            values   = [
-                min(r.disparate_impact, 1.0) if not np.isnan(r.disparate_impact) else 0.0,
-                min(r.approval_rate * 2, 1.0),   # scale so 50% approval = edge
-                eopd_inv,
-            ]
+            di_sev = max(0.0, 1.0 - min(r.disparate_impact, 1.0)) if not np.isnan(r.disparate_impact) else 1.0
+            eopd_sev = min(abs(r.equal_opportunity_diff), 1.0) if not np.isnan(r.equal_opportunity_diff) else 0.0
+            pred_gap = (
+                min(abs(_priv_pred_rate - r.pred_approval_rate) / _priv_pred_rate, 1.0)
+                if not np.isnan(r.pred_approval_rate) else 0.0
+            )
+            values = [di_sev, eopd_sev, pred_gap]
             fig_radar.add_trace(go.Scatterpolar(
                 r=values + [values[0]],
                 theta=radar_cats + [radar_cats[0]],
-                fill="toself", opacity=0.35,
-                name=r.group_label[:30],
+                fill="toself", opacity=0.45,
+                name=r.group_label[:35],
+                line=dict(width=2),
             ))
+
+        # Reference ring at 0.20 (minor bias) and 0.80 (critical bias)
+        fig_radar.add_trace(go.Scatterpolar(
+            r=[0.20, 0.20, 0.20, 0.20],
+            theta=radar_cats + [radar_cats[0]],
+            fill=None, opacity=0.4,
+            name="Minor bias (0.20)",
+            line=dict(color="#16a34a", width=1.2, dash="dot"),
+            showlegend=True,
+        ))
+        fig_radar.add_trace(go.Scatterpolar(
+            r=[0.80, 0.80, 0.80, 0.80],
+            theta=radar_cats + [radar_cats[0]],
+            fill=None, opacity=0.4,
+            name="Critical bias (0.80)",
+            line=dict(color="#dc2626", width=1.2, dash="dot"),
+            showlegend=True,
+        ))
+
         fig_radar.update_layout(
             polar=dict(
                 bgcolor="#161b22",
-                radialaxis=dict(visible=True, range=[0, 1], tickfont=dict(color="#8b949e", size=10),
-                                gridcolor="#30363d"),
-                angularaxis=dict(tickfont=dict(color="#c9d1d9", size=11), gridcolor="#30363d"),
+                radialaxis=dict(visible=True, range=[0, 1],
+                                tickfont=dict(color="#8b949e", size=10),
+                                gridcolor="#30363d", tickvals=[0.2, 0.4, 0.6, 0.8, 1.0]),
+                angularaxis=dict(tickfont=dict(color="#c9d1d9", size=12), gridcolor="#30363d"),
             ),
             paper_bgcolor="#0d1117", font_color="#e6edf3",
-            legend=dict(bgcolor="#161b22", bordercolor="#30363d"),
-            height=420, margin=dict(t=30, b=30, l=30, r=30),
+            legend=dict(bgcolor="#161b22", bordercolor="#30363d", font=dict(size=11)),
+            height=460, margin=dict(t=40, b=40, l=40, r=160),
         )
         st.plotly_chart(fig_radar, use_container_width=True, config={"displayModeBar": False})
         hint(
-            "Outer edge = ideal (DI=1.0, high approval, zero EOpD gap). "
-            "Groups collapsed toward the centre face severe compounding discrimination. "
-            "Use this chart in presentations — it communicates intersectional inequality visually."
+            "<b>Outer edge = most biased</b> (larger shape = more discrimination). "
+            "<b>DI Severity</b> = 1 − Disparate Impact (1.0 = completely excluded). "
+            "<b>EOpD Severity</b> = Equal Opportunity gap (True Positive Rate difference). "
+            "<b>Pred Rate Gap</b> = gap in model's positive-outcome rate vs privileged baseline. "
+            "Green ring = minor bias threshold (0.20). Red ring = critical bias threshold (0.80)."
         )
 
     st.divider()
@@ -2632,29 +2855,51 @@ with tab7:
         encoded   = st.session_state["share_encoded"]
         svg_bytes = st.session_state["share_svg"]
 
-        # Shareable URL (works locally + in cloud)
+        # Set the query param so the URL in the browser bar becomes the shareable link
+        st.query_params["audit"] = encoded
+
+        # Show the param portion for easy copy (browser address bar has the full URL)
         share_url = f"?audit={encoded}"
-        st.text_input("Shareable Audit URL (copy this):", value=share_url, key="share_url_display",
-                      help="Share this URL. Anyone opening it will see a summary of your audit results.")
+        st.info(
+            "✅ **Your browser's address bar now contains the shareable URL.** "
+            "Copy it directly from there, or paste the snippet below after your app's base URL."
+        )
+        st.text_input(
+            "URL parameter (append to your app URL):",
+            value=share_url, key="share_url_display",
+            help="Paste after your app address, e.g. https://your-app.streamlit.app?audit=...",
+        )
+
+        # Live preview of the certificate
+        with st.expander("🏅 Preview Audit Certificate", expanded=True):
+            try:
+                _prev_payload = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
+                render_audit_certificate(_prev_payload)
+            except Exception:
+                st.caption("Preview unavailable.")
 
         # Badge preview + embed code
         svg_b64 = base64.b64encode(svg_bytes).decode()
         badge_img = f"data:image/svg+xml;base64,{svg_b64}"
-        st.markdown(f'<img src="{badge_img}" alt="Fairness Audit Badge" style="height:28px;margin:0.5rem 0">', unsafe_allow_html=True)
+        st.markdown("**Badge Preview:**")
+        st.markdown(
+            f'<img src="{badge_img}" alt="Fairness Audit Badge" style="height:32px;margin:0.4rem 0;border-radius:4px">',
+            unsafe_allow_html=True,
+        )
 
         primary  = result.config.primary_protected_attr()
         bm       = result.baseline_eval.fairness.get(primary) if result.baseline_eval else None
-        di_val   = bm.disparate_impact if bm and not np.isnan(bm.disparate_impact) else None
         severity = bm.severity if bm else "UNKNOWN"
 
-        embed_md  = f"![Fairness Audit]({badge_img})"
-        embed_html = f'<img src="{badge_img}" alt="Aequitas Prime Fairness Audit — {severity}" height="20">'
+        embed_md   = f"[![Fairness Audit](YOUR_APP_URL{share_url})](YOUR_APP_URL{share_url})"
+        embed_html = f'<a href="YOUR_APP_URL{share_url}"><img src="{badge_img}" alt="Aequitas Prime Fairness Audit — {severity}" height="28"></a>'
 
-        with st.expander("Embed code"):
-            st.markdown("**Markdown (GitHub README):**")
+        with st.expander("Embed code (GitHub README / website)"):
+            st.markdown("**Markdown:**")
             st.code(embed_md, language="markdown")
-            st.markdown("**HTML:**")
+            st.markdown("**HTML (with clickable link):**")
             st.code(embed_html, language="html")
+            st.caption("Replace `YOUR_APP_URL` with the base URL of this Streamlit app.")
 
         st.download_button(
             label="⬇️ Download Badge SVG",

@@ -47,12 +47,12 @@ class TestIntersectionalMetrics:
         assert dis == sorted(dis), "Results must be sorted ascending by DI"
 
     def test_group_size_above_minimum(self, biased_df, base_config):
-        """Groups below MIN_GROUP_SIZE should be filtered out."""
-        from src.bias_engine.intersectional import MIN_GROUP_SIZE
+        """Groups below MIN_GROUP_SIZE_SKIP should be filtered out."""
+        from src.bias_engine.intersectional import MIN_GROUP_SIZE_SKIP
         results = compute_intersectional_metrics(biased_df, base_config)
         for r in results:
-            assert r.group_size >= MIN_GROUP_SIZE, \
-                f"Group '{r.group_label}' has {r.group_size} < MIN_GROUP_SIZE={MIN_GROUP_SIZE}"
+            assert r.group_size >= MIN_GROUP_SIZE_SKIP, \
+                f"Group '{r.group_label}' has {r.group_size} < MIN_GROUP_SIZE_SKIP={MIN_GROUP_SIZE_SKIP}"
 
     def test_with_y_pred_populates_eopd(self, biased_df, base_config):
         y_pred = biased_df["income"].to_numpy()

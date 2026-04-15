@@ -119,6 +119,7 @@ def run_mitigation_steps(
     inprocess_method: str = "expgrad",
     base_model: str = "rf",
     verbose: bool = True,
+    target_attr: str | None = None,
 ) -> AuditResult:
     """
     Run only the mitigation steps on an AuditResult that already has a
@@ -126,6 +127,12 @@ def run_mitigation_steps(
 
     V2: Uses train_preprocessed_presplit() to avoid data leakage —
     reweighing is fitted on training rows only.
+
+    Parameters
+    ----------
+    target_attr : str, optional
+        Protected attribute to target for bias mitigation.
+        Defaults to the most biased attribute by lowest Disparate Impact.
     """
     def log(msg):
         if verbose:
@@ -135,7 +142,19 @@ def run_mitigation_steps(
     y        = result._y
     df_clean = result._df_clean
     config   = result.config
-    primary  = config.primary_protected_attr()
+
+    # Default to the most biased attribute (lowest DI) for meaningful mitigation
+    if target_attr is None:
+        if result.baseline_eval and result.baseline_eval.fairness:
+            primary = min(
+                result.baseline_eval.fairness.keys(),
+                key=lambda a: result.baseline_eval.fairness[a].disparate_impact
+                              if not np.isnan(result.baseline_eval.fairness[a].disparate_impact) else 1.0
+            )
+        else:
+            primary = config.primary_protected_attr()
+    else:
+        primary = target_attr
 
     # ── V2 Leakage fix: fit reweighing on training rows only ─────────────────
     log("Step 1/2 — Reweighing on train-only (V2 leakage fix) + pre-processed model...")
